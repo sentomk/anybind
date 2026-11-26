@@ -54,17 +54,13 @@ npx anybind-stubgen build/example.node example.d.ts
 
 ## Roadmap
 
-- [x] Free functions and lambdas: `bool`, arithmetic types, `std::string`
-- [x] C++ exceptions → JS errors, argument type checking
-- [x] `.d.ts` generation (`anybind-stubgen`)
-- [x] Named arguments (`anybind::arg("x")`) and default values
-- [ ] Classes, methods, properties, enums
-- [ ] Ownership and lifetime policies
-- [ ] `std::vector`, `std::optional`, `std::variant`, `std::function`, `bigint`
-- [ ] TypedArray / ArrayBuffer zero-copy views
-- [ ] Async: thread-safe functions, C++20 coroutines ↔ Promise
-- [x] Windows support (MSVC; delay-loaded, so addons also load in Electron and other hosts)
-- [ ] CI across Node.js, Bun, Deno, Electron, React Native, HarmonyOS
+Done so far: free functions and lambdas (`bool`, arithmetic types, `std::string`), argument
+type checking, C++ exceptions → JS errors, named arguments with defaults, `.d.ts`
+generation, and Windows support.
+
+Next is **0.1.0**, the first release meant for real use: classes, STL types, `bigint`,
+callbacks, zero-copy buffers and async. See [ROADMAP.md](ROADMAP.md) for the full plan and
+release criteria.
 
 ## Development
 
