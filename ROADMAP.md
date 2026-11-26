@@ -30,23 +30,23 @@ use Node-API).
 
 ## 0.1.0: binding a real C++ library
 
-The first minor release must answer one question for users: *can I bind my C++ library
-with this?* It ships only once every release criterion below is met.
+The first minor release must answer one question for users: _can I bind my C++ library
+with this?_ It ships only once every release criterion below is met.
 
 ### Scope, in dependency order
 
 1. **Foundations**
    - [ ] Composable TypeScript type names (to support `Array<T>`, `T | undefined`, nested
-     types); today each caster has a fixed `ts_name`.
+         types); today each caster has a fixed `ts_name`.
    - [ ] Per-environment type registry via instance data, so the addon works when loaded
-     several times (worker threads, multiple contexts).
+         several times (worker threads, multiple contexts).
    - [ ] Handle types for holding JS values in C++: `object`, `function`, persistent
-     references.
+         references.
    - [ ] `.d.ts` generation at build time, without loading the `.node` (needed for
-     cross-compilation, e.g. HarmonyOS or Android arm64 built on an x86 host).
+         cross-compilation, e.g. HarmonyOS or Android arm64 built on an x86 host).
 2. **Type system**
    - [ ] `std::vector` / `std::array` ↔ `Array`, `std::optional` ↔ `T | undefined`,
-     `std::variant` ↔ union, `std::map` / plain structs ↔ objects, `std::string_view`
+         `std::variant` ↔ union, `std::map` / plain structs ↔ objects, `std::string_view`
    - [ ] 64-bit integers ↔ `bigint`
    - [ ] Synchronous callbacks: `std::function` ↔ JS functions
    - [ ] Function overloads, emitted as TypeScript overloads
@@ -54,7 +54,7 @@ with this?* It ships only once every release criterion below is met.
    - [ ] `class_<T>`: constructors, methods, properties, static members
    - [ ] Enums and inheritance
    - [ ] Ownership policies (take ownership, reference, reference-internal,
-     `std::shared_ptr`)
+         `std::shared_ptr`)
    - [ ] Object identity: the same C++ object always maps to the same JS object
    - [ ] Class declarations in the generated `.d.ts`, with C++ doc comments carried over
 4. **Binary data and async**
@@ -73,11 +73,11 @@ with this?* It ships only once every release criterion below is met.
   - **zstd or xxHash**: buffers, `bigint`, async
 - [ ] CI green on Node.js 18–24, Electron, Bun and Deno, across Linux, macOS and Windows
 - [ ] Published comparison with `node-addon-api`: lines of binding code, compile time,
-  binary size, call overhead
+      binary size, call overhead
 - [ ] Documentation: getting started, conversion rules for every type, ownership guide,
-  migration guide from `node-addon-api`
+      migration guide from `node-addon-api`
 - [ ] Public API review: the API shape should be stable at release, since breaking changes
-  get expensive once users adopt it
+      get expensive once users adopt it
 - [ ] Scope locked: anything not listed above goes to 0.2
 
 **Launch demo:** one `.node` file loaded in Node, Bun, Deno and Electron, the generated
@@ -86,7 +86,7 @@ with this?* It ships only once every release criterion below is met.
 ## 0.2: distribution and ecosystem
 
 - [ ] `anybind` CLI: cross-platform prebuilds, per-platform npm packages, GitHub Actions
-  templates
+      templates
 - [ ] React Native (Node-API for Hermes)
 - [ ] C++20 coroutines ↔ `Promise`
 
