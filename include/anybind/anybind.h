@@ -1,5 +1,7 @@
-// anybind: modern C++ bindings for every Node-API runtime.
-// SPDX-License-Identifier: MIT
+/*
+ * anybind: modern C++ bindings for every Node-API runtime.
+ * SPDX-License-Identifier: MIT
+ */
 #pragma once
 
 #ifndef NAPI_VERSION
@@ -12,6 +14,7 @@
 #include <cstdint>
 #include <exception>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -25,14 +28,16 @@
 
 namespace anybind {
 
-/// Thrown when a JavaScript exception is already pending. Unwinds back to the
-/// JS boundary without raising a second error.
+/**
+ * Thrown when a JavaScript exception is already pending.
+ * Unwinds back to the JS boundary without raising a second error.
+ */
 class error_already_set : public std::exception {
  public:
   const char* what() const noexcept override { return "a JavaScript exception is pending"; }
 };
 
-/// Throw this from bound code to raise a JavaScript TypeError.
+/** Throw this from bound code to raise a JavaScript TypeError. */
 class type_error : public std::exception {
  public:
   explicit type_error(std::string message) : message_(std::move(message)) {}
@@ -41,6 +46,29 @@ class type_error : public std::exception {
  private:
   std::string message_;
 };
+
+/** Named argument paired with a default value (created via `arg("x") = value`). */
+template <typename T>
+struct arg_v {
+  const char* name;
+  T value;
+};
+
+/** Names a function parameter in `module_::def`, optionally with a default value. */
+struct arg {
+  const char* name;
+
+  constexpr explicit arg(const char* name) : name(name) {}
+
+  template <typename T>
+  arg_v<std::decay_t<T>> operator=(T&& value) const {
+    return arg_v<std::decay_t<T>>{name, std::forward<T>(value)};
+  }
+};
+
+namespace literals {
+inline arg operator""_a(const char* name, std::size_t) { return arg(name); }
+}  // namespace literals
 
 class module_;
 
@@ -57,8 +85,7 @@ inline void check(napi_env env, napi_status status) {
   // Must be read before any other Node-API call overwrites it.
   const napi_extended_error_info* info = nullptr;
   napi_get_last_error_info(env, &info);
-  std::string message =
-      info && info->error_message ? info->error_message : "Node-API call failed";
+  std::string message = info && info->error_message ? info->error_message : "Node-API call failed";
   bool pending = false;
   napi_is_exception_pending(env, &pending);
   if (pending) throw error_already_set();
@@ -72,9 +99,7 @@ inline void expect_type(napi_env env, napi_value value, napi_valuetype expected,
   if (actual != expected) throw type_error("expected " + std::string(ts_name));
 }
 
-// ---------------------------------------------------------------------------
-// Type casters: C++ <-> JS conversion plus the TypeScript name used for stubs.
-// ---------------------------------------------------------------------------
+/* === Type casters: C++ <-> JS conversion plus TypeScript names for stubs === */
 
 template <typename T, typename SFINAE = void>
 struct type_caster {
@@ -156,9 +181,7 @@ constexpr std::string_view ts_name_of() {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Callable introspection
-// ---------------------------------------------------------------------------
+/* === Callable introspection === */
 
 template <typename F>
 struct function_traits : function_traits<decltype(&F::operator())> {};
@@ -180,11 +203,75 @@ struct function_traits<R (C::*)(A...) noexcept> : function_traits<R (*)(A...)> {
 template <typename C, typename R, typename... A>
 struct function_traits<R (C::*)(A...) const noexcept> : function_traits<R (*)(A...)> {};
 
-// ---------------------------------------------------------------------------
-// Calling C++ from JS
-// ---------------------------------------------------------------------------
+/* === Argument specs === */
 
-/// Runs `fn` and translates any C++ exception into a pending JS exception.
+template <typename T>
+struct is_arg : std::false_type {};
+template <>
+struct is_arg<arg> : std::true_type {};
+template <typename T>
+struct is_arg<arg_v<T>> : std::true_type {};
+
+template <typename T>
+struct arg_slot {
+  std::string name;
+  std::optional<T> default_value;
+};
+
+template <typename T>
+arg_slot<T> make_arg_slot(const arg& a) {
+  return arg_slot<T>{a.name ? a.name : "", std::nullopt};
+}
+
+template <typename T, typename V>
+arg_slot<T> make_arg_slot(arg_v<V>&& a) {
+  static_assert(std::is_convertible_v<V&&, T>,
+                "anybind::arg: default value is not convertible to the parameter type");
+  return arg_slot<T>{a.name ? a.name : "", std::optional<T>(std::in_place, std::move(a.value))};
+}
+
+template <typename T, typename V>
+arg_slot<T> make_arg_slot(const arg_v<V>& a) {
+  static_assert(std::is_convertible_v<const V&, T>,
+                "anybind::arg: default value is not convertible to the parameter type");
+  return arg_slot<T>{a.name ? a.name : "", std::optional<T>(std::in_place, a.value)};
+}
+
+/* Overload 1: no arg() specs passed (backward compatible). */
+template <typename... A>
+std::tuple<arg_slot<intrinsic_t<A>>...> make_arg_slots(type_list<A...>) {
+  return {};
+}
+
+/* Overload 2: one arg() spec per parameter. */
+template <typename FirstA, typename... RestA, typename FirstExtra, typename... RestExtra>
+std::tuple<arg_slot<intrinsic_t<FirstA>>, arg_slot<intrinsic_t<RestA>>...> make_arg_slots(
+    type_list<FirstA, RestA...>, FirstExtra&& first, RestExtra&&... rest) {
+  return {make_arg_slot<intrinsic_t<FirstA>>(std::forward<FirstExtra>(first)),
+          make_arg_slot<intrinsic_t<RestA>>(std::forward<RestExtra>(rest))...};
+}
+
+template <typename List>
+struct slots_for_list;
+
+template <typename... A>
+struct slots_for_list<type_list<A...>> {
+  using type = std::tuple<arg_slot<intrinsic_t<A>>...>;
+};
+
+template <typename SlotsTuple, size_t... I>
+size_t compute_min_args([[maybe_unused]] const SlotsTuple& slots, std::index_sequence<I...>) {
+  size_t min_args = 0;
+  [[maybe_unused]] auto check_one = [&](size_t idx, const auto& slot) {
+    if (!slot.default_value.has_value()) min_args = idx + 1;
+  };
+  (check_one(I, std::get<I>(slots)), ...);
+  return min_args;
+}
+
+/* === Calling C++ from JS === */
+
+/* Runs `fn` and translates any C++ exception into a pending JS exception. */
 template <typename Fn>
 napi_value guard(napi_env env, Fn&& fn) noexcept {
   try {
@@ -202,20 +289,30 @@ napi_value guard(napi_env env, Fn&& fn) noexcept {
 }
 
 template <typename T>
-T load_arg(napi_env env, napi_value value, size_t index) {
+T load_arg(napi_env env, napi_value* argv, size_t argc, size_t index, const arg_slot<T>& slot) {
+  if (slot.default_value.has_value()) {
+    // Missing trailing argument or explicit `undefined` falls back to default.
+    if (index >= argc) return *slot.default_value;
+    napi_valuetype actual;
+    check(env, napi_typeof(env, argv[index], &actual));
+    if (actual == napi_undefined) return *slot.default_value;
+  }
   try {
-    return type_caster<T>::from_js(env, value);
+    return type_caster<T>::from_js(env, argv[index]);
   } catch (const type_error& e) {
-    throw type_error("argument " + std::to_string(index + 1) + ": " + e.what());
+    std::string prefix = "argument " + std::to_string(index + 1);
+    if (!slot.name.empty()) prefix += " (" + slot.name + ")";
+    throw type_error(prefix + ": " + e.what());
   }
 }
 
-template <typename R, typename F, typename... A, size_t... I>
-napi_value call(napi_env env, F& f, [[maybe_unused]] napi_value* argv, type_list<A...>,
+template <typename R, typename F, typename SlotsTuple, typename... A, size_t... I>
+napi_value call(napi_env env, F& f, [[maybe_unused]] napi_value* argv, [[maybe_unused]] size_t argc,
+                [[maybe_unused]] const SlotsTuple& slots, type_list<A...>,
                 std::index_sequence<I...>) {
   // Braced initialization guarantees left-to-right argument conversion.
   [[maybe_unused]] std::tuple<intrinsic_t<A>...> values{
-      load_arg<intrinsic_t<A>>(env, argv[I], I)...};
+      load_arg<intrinsic_t<A>>(env, argv, argc, I, std::get<I>(slots))...};
   if constexpr (std::is_void_v<R>) {
     f(std::get<I>(values)...);
     napi_value undefined;
@@ -228,38 +325,66 @@ napi_value call(napi_env env, F& f, [[maybe_unused]] napi_value* argv, type_list
 
 template <typename Func>
 struct function_record {
+  using traits = function_traits<Func>;
+  using slots_t = typename slots_for_list<typename traits::args>::type;
+
   Func f;
+  slots_t slots;
+  size_t min_args;
 
   static napi_value invoke(napi_env env, napi_callback_info info) {
     return guard(env, [&]() -> napi_value {
-      using traits = function_traits<Func>;
       constexpr size_t arity = traits::arity;
       size_t argc = arity;
       napi_value argv[arity > 0 ? arity : 1];
       void* data = nullptr;
       check(env, napi_get_cb_info(env, info, &argc, argv, nullptr, &data));
-      if (argc != arity) {
-        throw type_error("expected " + std::to_string(arity) + " argument(s), got " +
-                         std::to_string(argc));
-      }
       auto* record = static_cast<function_record*>(data);
-      return call<typename traits::return_type>(env, record->f, argv, typename traits::args{},
+      if (argc < record->min_args || argc > arity) {
+        std::string expected = record->min_args == arity ? std::to_string(arity)
+                                                         : std::to_string(record->min_args) +
+                                                               " to " + std::to_string(arity);
+        throw type_error("expected " + expected + " argument(s), got " + std::to_string(argc));
+      }
+      return call<typename traits::return_type>(env, record->f, argv, argc, record->slots,
+                                                typename traits::args{},
                                                 std::make_index_sequence<arity>{});
     });
   }
 
-  static void finalize(napi_env, void* data, void*) {
-    delete static_cast<function_record*>(data);
-  }
+  static void finalize(napi_env, void* data, void*) { delete static_cast<function_record*>(data); }
 };
 
-template <typename R, typename... A>
-std::string ts_signature(const char* name, type_list<A...>) {
+template <typename R, typename... A, typename SlotsTuple, size_t... I>
+std::string ts_signature(const char* name, type_list<A...>,
+                         [[maybe_unused]] const SlotsTuple& slots, [[maybe_unused]] size_t min_args,
+                         std::index_sequence<I...>) {
   std::string s = "export function ";
   s += name;
   s += '(';
-  size_t i = 0;
-  ((s += (i ? ", arg" : "arg"), s += std::to_string(i++), s += ": ", s += ts_name_of<A>()), ...);
+  [[maybe_unused]] auto append_param = [&](size_t i, const auto& slot, std::string_view type_name) {
+    if (i > 0) s += ", ";
+    if (slot.name.empty()) {
+      s += "arg";
+      s += std::to_string(i);
+    } else {
+      s += slot.name;
+    }
+    if (i >= min_args) {
+      // Trailing optional parameter.
+      s += "?: ";
+      s += type_name;
+    } else if (slot.default_value.has_value()) {
+      // Non-trailing default: TS forbids `?` before a required parameter.
+      s += ": ";
+      s += type_name;
+      s += " | undefined";
+    } else {
+      s += ": ";
+      s += type_name;
+    }
+  };
+  (append_param(I, std::get<I>(slots), ts_name_of<A>()), ...);
   s += "): ";
   s += ts_name_of<R>();
   s += ";\n";
@@ -268,19 +393,30 @@ std::string ts_signature(const char* name, type_list<A...>) {
 
 }  // namespace detail
 
-/// Handle to the module being initialized inside ANYBIND_MODULE.
+/** Handle to the module being initialized inside ANYBIND_MODULE. */
 class module_ {
  public:
   module_(napi_env env, napi_value exports) : env_(env), exports_(exports) {}
 
-  /// Binds a free function, function pointer or (capturing) lambda.
-  template <typename Func>
-  module_& def(const char* name, Func&& f) {
+  /** Binds a free function, function pointer or (capturing) lambda. */
+  template <typename Func, typename... Extra>
+  module_& def(const char* name, Func&& f, Extra&&... extra) {
     using F = std::decay_t<Func>;
     using record_t = detail::function_record<F>;
     using traits = detail::function_traits<F>;
+    using indices = std::make_index_sequence<traits::arity>;
 
-    auto* record = new record_t{std::forward<Func>(f)};
+    static_assert((detail::is_arg<std::decay_t<Extra>>::value && ...),
+                  "anybind::def: extra arguments must be anybind::arg");
+    static_assert(sizeof...(Extra) == 0 || sizeof...(Extra) == traits::arity,
+                  "anybind::def: number of anybind::arg specs must match function arity");
+
+    auto slots = detail::make_arg_slots(typename traits::args{}, std::forward<Extra>(extra)...);
+    size_t min_args = detail::compute_min_args(slots, indices{});
+    std::string sig = detail::ts_signature<typename traits::return_type>(
+        name, typename traits::args{}, slots, min_args, indices{});
+
+    auto* record = new record_t{std::forward<Func>(f), std::move(slots), min_args};
     napi_value fn;
     napi_status status =
         napi_create_function(env_, name, NAPI_AUTO_LENGTH, &record_t::invoke, record, &fn);
@@ -292,13 +428,14 @@ class module_ {
       detail::check(env_, status);
     }
     detail::check(env_, napi_set_named_property(env_, exports_, name, fn));
-    dts_ += detail::ts_signature<typename traits::return_type>(name, typename traits::args{});
+    dts_ += sig;
     return *this;
   }
 
   napi_env env() const { return env_; }
   napi_value exports() const { return exports_; }
-  /// TypeScript declarations for everything bound so far.
+
+  /** TypeScript declarations for everything bound so far. */
   const std::string& dts() const { return dts_; }
 
  private:
@@ -316,7 +453,7 @@ inline napi_value init_module(napi_env env, napi_value exports, void (*init)(mod
     // Hidden (non-enumerable) property read by `anybind-stubgen`.
     napi_value dts;
     check(env, napi_create_string_utf8(env, m.dts().data(), m.dts().size(), &dts));
-    napi_property_descriptor desc{"__anybind_dts__", nullptr, nullptr, nullptr,
+    napi_property_descriptor desc{"__anybind_dts__", nullptr, nullptr,      nullptr,
                                   nullptr,           dts,     napi_default, nullptr};
     check(env, napi_define_properties(env, exports, 1, &desc));
     return exports;
@@ -326,14 +463,16 @@ inline napi_value init_module(napi_env env, napi_value exports, void (*init)(mod
 }  // namespace detail
 }  // namespace anybind
 
-/// Defines the entry point of an anybind extension.
-///
-///   ANYBIND_MODULE(my_addon, m) {
-///     m.def("add", [](int a, int b) { return a + b; });
-///   }
-#define ANYBIND_MODULE(name, variable)                                          \
-  static void anybind_init_##name(::anybind::module_&);                         \
-  NAPI_MODULE_INIT() {                                                          \
-    return ::anybind::detail::init_module(env, exports, &anybind_init_##name);  \
-  }                                                                             \
+/**
+ * Defines the entry point of an anybind extension.
+ *
+ *  ANYBIND_MODULE(my_addon, m) {
+ *    m.def("add", [](int a, int b) { return a + b; });
+ *  }
+ */
+#define ANYBIND_MODULE(name, variable)                                         \
+  static void anybind_init_##name(::anybind::module_&);                        \
+  NAPI_MODULE_INIT() {                                                         \
+    return ::anybind::detail::init_module(env, exports, &anybind_init_##name); \
+  }                                                                            \
   static void anybind_init_##name(::anybind::module_& variable)

@@ -33,9 +33,9 @@ anybind_add_module(example example.cpp)
 ```
 
 ```js
-const m = require('./build/example.node');
-m.add(1, 2);      // 3
-m.add('1', 2);    // TypeError: argument 1: expected number
+const m = require("./build/example.node");
+m.add(1, 2); // 3
+m.add("1", 2); // TypeError: argument 1: expected number
 ```
 
 ```sh
@@ -57,7 +57,7 @@ npx anybind-stubgen build/example.node example.d.ts
 - [x] Free functions and lambdas: `bool`, arithmetic types, `std::string`
 - [x] C++ exceptions → JS errors, argument type checking
 - [x] `.d.ts` generation (`anybind-stubgen`)
-- [ ] Named arguments (`anybind::arg("x")`) and default values
+- [x] Named arguments (`anybind::arg("x")`) and default values
 - [ ] Classes, methods, properties, enums
 - [ ] Ownership and lifetime policies
 - [ ] `std::vector`, `std::optional`, `std::variant`, `std::function`, `bigint`

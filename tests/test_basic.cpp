@@ -1,5 +1,6 @@
 #include <anybind/anybind.h>
 
+#include <cmath>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -7,6 +8,20 @@
 static int add(int a, int b) { return a + b; }
 
 ANYBIND_MODULE(test_basic, m) {
+  using namespace anybind::literals;
+  m.def(
+      "power", [](double base, int exp) { return std::pow(base, exp); }, anybind::arg("base"),
+      anybind::arg("exp") = 2);
+  m.def(
+      "welcome",
+      [](const std::string& who, const std::string& prefix) { return prefix + ", " + who; },
+      "who"_a = "world", "prefix"_a = "hello");
+  m.def(
+      "formatTag",
+      [](const std::string& prefix, int id, const std::string& suffix) {
+        return prefix + std::to_string(id) + suffix;
+      },
+      "prefix"_a = "item-", "id"_a, "suffix"_a = "");
   m.def("add", &add);
   m.def("scale", [](double x, float k) { return x * k; });
   m.def("greet", [](const std::string& who) { return "hello, " + who; });
