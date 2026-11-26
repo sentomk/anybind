@@ -241,16 +241,18 @@ bool arithmetic_value_fits(V v) {
       if constexpr (LV::digits <= LT::digits) {
         return true;
       } else {
-        return static_cast<std::make_unsigned_t<V>>(v) <= LT::max();
+        using UV = std::make_unsigned_t<V>;
+        return static_cast<UV>(v) <= static_cast<UV>(LT::max());
       }
     } else if constexpr (LV::digits <= LT::digits) {
       return true;
     } else if constexpr (!std::is_signed_v<V> && std::is_signed_v<T>) {
       return v <= static_cast<std::make_unsigned_t<T>>(LT::max());
     } else if constexpr (std::is_signed_v<V>) {
-      return v >= LT::min() && v <= LT::max();
+      // T is narrower than V here, so its limits are representable as V.
+      return v >= static_cast<V>(LT::min()) && v <= static_cast<V>(LT::max());
     } else {
-      return v <= LT::max();
+      return v <= static_cast<V>(LT::max());
     }
   } else if constexpr (std::is_integral_v<T>) {
     // Floating-point value into an integer: must be integral and in [lo, hi).
@@ -300,7 +302,8 @@ arg_slot<T> make_arg_slot(arg_v<V>&& a) {
   static_assert(std::is_convertible_v<V&&, T>,
                 "anybind::arg: default value is not convertible to the parameter type");
   check_default_value<T>(a.name, a.value);
-  return arg_slot<T>{a.name ? a.name : "", std::optional<T>(std::in_place, std::move(a.value))};
+  // Explicit: arithmetic narrowing was range-checked above.
+  return arg_slot<T>{a.name ? a.name : "", std::optional<T>(static_cast<T>(std::move(a.value)))};
 }
 
 template <typename T, typename V>
@@ -308,7 +311,7 @@ arg_slot<T> make_arg_slot(const arg_v<V>& a) {
   static_assert(std::is_convertible_v<const V&, T>,
                 "anybind::arg: default value is not convertible to the parameter type");
   check_default_value<T>(a.name, a.value);
-  return arg_slot<T>{a.name ? a.name : "", std::optional<T>(std::in_place, a.value)};
+  return arg_slot<T>{a.name ? a.name : "", std::optional<T>(static_cast<T>(a.value))};
 }
 
 /* Overload 1: no arg() specs passed (backward compatible). */
