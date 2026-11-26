@@ -1,7 +1,7 @@
-import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createRequire } from "node:module";
 import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
+import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
@@ -144,7 +144,9 @@ test("accepts numeric defaults that fit the parameter type", () => {
 
 test("numeric default values are range-checked", () => {
   const checks = require(
-    fileURLToPath(new URL("../build/tests/test_defaults.node", import.meta.url)),
+    fileURLToPath(
+      new URL("../build/tests/test_defaults.node", import.meta.url),
+    ),
   );
   assert.equal(checks.failures(), "");
 });
@@ -154,7 +156,8 @@ test("a truncating default value makes the module fail to load", () => {
     new URL("../build/tests/test_bad_default.node", import.meta.url),
   );
   assert.throws(() => require(bad), {
-    message: /anybind::arg\("x"\): default value does not fit the parameter type/,
+    message:
+      /anybind::arg\("x"\): default value does not fit the parameter type/,
   });
 });
 

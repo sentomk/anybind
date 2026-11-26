@@ -2,20 +2,21 @@
 // Generates a .d.ts file from a compiled anybind extension.
 //
 //   anybind-stubgen build/my_addon.node [my_addon.d.ts]
-import { createRequire } from 'node:module';
-import { writeFileSync } from 'node:fs';
-import path from 'node:path';
+
+import { writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import path from "node:path";
 
 const [addonPath, outPath] = process.argv.slice(2);
 if (!addonPath) {
-  console.error('usage: anybind-stubgen <addon.node> [out.d.ts]');
+  console.error("usage: anybind-stubgen <addon.node> [out.d.ts]");
   process.exit(1);
 }
 
 const require = createRequire(import.meta.url);
 const addon = require(path.resolve(addonPath));
 const dts = addon.__anybind_dts__;
-if (typeof dts !== 'string') {
+if (typeof dts !== "string") {
   console.error(`anybind-stubgen: ${addonPath} was not built with anybind`);
   process.exit(1);
 }
