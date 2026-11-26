@@ -1,0 +1,49 @@
+{
+  "name": "anybind",
+  "version": "0.0.1",
+  "description": "Modern C++ bindings for every Node-API runtime. Bind to any runtime, never return `any`.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sentomk/anybind.git"
+  },
+  "homepage": "https://github.com/sentomk/anybind#readme",
+  "bugs": "https://github.com/sentomk/anybind/issues",
+  "keywords": [
+    "node-api",
+    "napi",
+    "c++",
+    "bindings",
+    "addon",
+    "native",
+    "typescript",
+    "bun",
+    "electron",
+    "react-native",
+    "harmonyos"
+  ],
+  "main": "index.js",
+  "types": "index.d.ts",
+  "bin": {
+    "anybind-stubgen": "bin/anybind-stubgen.mjs"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "include/",
+    "cmake/",
+    "bin/",
+    "CMakeLists.txt"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build:test": "cmake -S . -B build -DANYBIND_BUILD_TESTS=ON && cmake --build build",
+    "test": "npm run build:test && node --test tests/*.test.mjs"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  }
+}

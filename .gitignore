@@ -1,0 +1,7 @@
+build/
+node_modules/
+*.node
+*.tgz
+.cache/
+compile_commands.json
+.DS_Store
