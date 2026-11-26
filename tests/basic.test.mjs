@@ -157,3 +157,15 @@ test("a truncating default value makes the module fail to load", () => {
     message: /anybind::arg\("x"\): default value does not fit the parameter type/,
   });
 });
+
+test("rejects numbers outside the range of float", () => {
+  assert.throws(() => m.scale(1, 1e300), {
+    name: "TypeError",
+    message: /argument 2: expected a number in the range/,
+  });
+  assert.throws(() => m.scale(1, -1e300), TypeError);
+  // Rounding, infinities and NaN are still accepted.
+  assert.equal(m.scale(1, Infinity), Infinity);
+  assert.ok(Number.isNaN(m.scale(1, Number.NaN)));
+  assert.equal(m.scale(2, 3.4e38), 2 * Math.fround(3.4e38));
+});

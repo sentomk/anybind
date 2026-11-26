@@ -137,6 +137,13 @@ struct type_caster<T, std::enable_if_t<std::is_arithmetic_v<T> && !std::is_same_
       if (!(d >= lo && d < hi) || std::trunc(d) != d) {
         throw type_error("expected an integer in the range of the C++ parameter type");
       }
+    } else if constexpr (static_cast<long double>(std::numeric_limits<T>::max()) <
+                         static_cast<long double>(std::numeric_limits<double>::max())) {
+      // Narrowing a finite double outside T's range is undefined behavior.
+      // Rounding within range is fine; inf and NaN convert as-is.
+      if (std::isfinite(d) && std::fabs(d) > static_cast<double>(std::numeric_limits<T>::max())) {
+        throw type_error("expected a number in the range of the C++ parameter type");
+      }
     }
     return static_cast<T>(d);
   }
