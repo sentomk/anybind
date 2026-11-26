@@ -218,6 +218,71 @@ struct arg_slot {
   std::optional<T> default_value;
 };
 
+/*
+ * Whether arithmetic value `v` survives conversion to `T` without being
+ * truncated or overflowing. Every comparison is ordered so that no step of
+ * the check itself performs an out-of-range (undefined) conversion.
+ */
+template <typename T, typename V>
+bool arithmetic_value_fits(V v) {
+  using LT = std::numeric_limits<T>;
+  using LV = std::numeric_limits<V>;
+  if constexpr (std::is_integral_v<T> && std::is_integral_v<V>) {
+    // Ranges that trivially fit are skipped to avoid always-true comparisons.
+    if constexpr (std::is_signed_v<V> && !std::is_signed_v<T>) {
+      if (v < 0) return false;
+      if constexpr (LV::digits <= LT::digits) {
+        return true;
+      } else {
+        return static_cast<std::make_unsigned_t<V>>(v) <= LT::max();
+      }
+    } else if constexpr (LV::digits <= LT::digits) {
+      return true;
+    } else if constexpr (!std::is_signed_v<V> && std::is_signed_v<T>) {
+      return v <= static_cast<std::make_unsigned_t<T>>(LT::max());
+    } else if constexpr (std::is_signed_v<V>) {
+      return v >= LT::min() && v <= LT::max();
+    } else {
+      return v <= LT::max();
+    }
+  } else if constexpr (std::is_integral_v<T>) {
+    // Floating-point value into an integer: must be integral and in [lo, hi).
+    const double d = static_cast<double>(v);
+    const double hi = std::ldexp(1.0, LT::digits);
+    const double lo = std::is_signed_v<T> ? -hi : 0.0;
+    return d >= lo && d < hi && std::trunc(d) == d;
+  } else if constexpr (std::is_integral_v<V>) {
+    // Integer into a floating-point type: must be exactly representable.
+    // Every integer with at most LT::digits significant bits is exact.
+    if constexpr (LV::digits <= LT::digits) {
+      return true;
+    } else {
+      using wide = std::conditional_t<std::is_signed_v<V>, std::intmax_t, std::uintmax_t>;
+      const wide limit = wide{1} << LT::digits;  // LT::digits < LV::digits, so no overflow
+      const wide w = static_cast<wide>(v);
+      if constexpr (std::is_signed_v<V>) {
+        return w >= -limit && w <= limit;
+      } else {
+        return w <= limit;
+      }
+    }
+  } else {
+    // Floating-point into floating-point: rounding is fine, overflow is not.
+    if (!std::isfinite(v)) return true;
+    return std::fabs(static_cast<long double>(v)) <= static_cast<long double>(LT::max());
+  }
+}
+
+template <typename T, typename V>
+void check_default_value([[maybe_unused]] const char* name, [[maybe_unused]] const V& value) {
+  if constexpr (std::is_arithmetic_v<T> && std::is_arithmetic_v<V>) {
+    if (!arithmetic_value_fits<T>(value)) {
+      throw std::invalid_argument(std::string("anybind::arg(\"") + (name ? name : "") +
+                                  "\"): default value does not fit the parameter type");
+    }
+  }
+}
+
 template <typename T>
 arg_slot<T> make_arg_slot(const arg& a) {
   return arg_slot<T>{a.name ? a.name : "", std::nullopt};
@@ -227,6 +292,7 @@ template <typename T, typename V>
 arg_slot<T> make_arg_slot(arg_v<V>&& a) {
   static_assert(std::is_convertible_v<V&&, T>,
                 "anybind::arg: default value is not convertible to the parameter type");
+  check_default_value<T>(a.name, a.value);
   return arg_slot<T>{a.name ? a.name : "", std::optional<T>(std::in_place, std::move(a.value))};
 }
 
@@ -234,6 +300,7 @@ template <typename T, typename V>
 arg_slot<T> make_arg_slot(const arg_v<V>& a) {
   static_assert(std::is_convertible_v<const V&, T>,
                 "anybind::arg: default value is not convertible to the parameter type");
+  check_default_value<T>(a.name, a.value);
   return arg_slot<T>{a.name ? a.name : "", std::optional<T>(std::in_place, a.value)};
 }
 
@@ -355,6 +422,39 @@ struct function_record {
   static void finalize(napi_env, void* data, void*) { delete static_cast<function_record*>(data); }
 };
 
+/*
+ * Turns a C++-side parameter name into a valid TypeScript parameter name.
+ * Only the generated declarations are affected; JS calls are positional.
+ */
+inline std::string ts_param_name(std::string_view name, size_t index) {
+  if (name.empty()) return "arg" + std::to_string(index);
+  std::string out;
+  out.reserve(name.size() + 1);
+  for (char c : name) {
+    const auto u = static_cast<unsigned char>(c);
+    // Bytes >= 0x80 are kept so UTF-8 identifiers survive unchanged.
+    const bool ok = u >= 0x80 || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                    (c >= '0' && c <= '9') || c == '_' || c == '$';
+    out += ok ? c : '_';
+  }
+  if (out[0] >= '0' && out[0] <= '9') out.insert(out.begin(), '_');
+  // Words TypeScript rejects as parameter names, plus `this`, which TS would
+  // silently treat as a `this` parameter and drop from the arity.
+  static constexpr std::string_view reserved[] = {
+      "break",  "case",     "catch",  "class",  "const",  "continue",   "debugger", "default",
+      "delete", "do",       "else",   "enum",   "export", "extends",    "false",    "finally",
+      "for",    "function", "if",     "import", "in",     "instanceof", "new",      "null",
+      "return", "super",    "switch", "this",   "throw",  "true",       "try",      "typeof",
+      "var",    "void",     "while",  "with"};
+  for (std::string_view word : reserved) {
+    if (out == word) {
+      out += '_';
+      break;
+    }
+  }
+  return out;
+}
+
 template <typename R, typename... A, typename SlotsTuple, size_t... I>
 std::string ts_signature(const char* name, type_list<A...>,
                          [[maybe_unused]] const SlotsTuple& slots, [[maybe_unused]] size_t min_args,
@@ -364,12 +464,7 @@ std::string ts_signature(const char* name, type_list<A...>,
   s += '(';
   [[maybe_unused]] auto append_param = [&](size_t i, const auto& slot, std::string_view type_name) {
     if (i > 0) s += ", ";
-    if (slot.name.empty()) {
-      s += "arg";
-      s += std::to_string(i);
-    } else {
-      s += slot.name;
-    }
+    s += ts_param_name(slot.name, i);
     if (i >= min_args) {
       // Trailing optional parameter.
       s += "?: ";

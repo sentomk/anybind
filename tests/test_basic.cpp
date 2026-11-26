@@ -31,4 +31,10 @@ ANYBIND_MODULE(test_basic, m) {
   m.def("fail", [] { throw std::runtime_error("boom"); });
   m.def("rejectArg", [](int) -> int { throw anybind::type_error("custom type error"); });
   m.def("next", [counter = 0]() mutable { return ++counter; });
+  m.def(
+      "keywords", [](int a, int b, int c, int d) { return a + b + c + d; }, "default"_a, "this"_a,
+      "my-arg"_a, "2d"_a);
+  m.def(
+      "fits", [](float a, std::uint8_t b, std::int64_t c) { return a + b + c; }, "a"_a = 2,
+      "b"_a = 255, "c"_a = -1);
 }

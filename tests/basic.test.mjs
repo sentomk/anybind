@@ -125,3 +125,35 @@ test("emits named and optional parameters in .d.ts", () => {
     /export function formatTag\(prefix: string \| undefined, id: number, suffix\?: string\): string;/,
   );
 });
+
+test("escapes parameter names that are not valid in TypeScript", () => {
+  assert.match(
+    m.__anybind_dts__,
+    /export function keywords\(default_: number, this_: number, my_arg: number, _2d: number\): number;/,
+  );
+  // Error messages keep the original C++-side name.
+  assert.throws(() => m.keywords("x", 1, 1, 1), {
+    name: "TypeError",
+    message: /argument 1 \(default\): expected number/,
+  });
+});
+
+test("accepts numeric defaults that fit the parameter type", () => {
+  assert.equal(m.fits(), 256);
+});
+
+test("numeric default values are range-checked", () => {
+  const checks = require(
+    fileURLToPath(new URL("../build/tests/test_defaults.node", import.meta.url)),
+  );
+  assert.equal(checks.failures(), "");
+});
+
+test("a truncating default value makes the module fail to load", () => {
+  const bad = fileURLToPath(
+    new URL("../build/tests/test_bad_default.node", import.meta.url),
+  );
+  assert.throws(() => require(bad), {
+    message: /anybind::arg\("x"\): default value does not fit the parameter type/,
+  });
+});
