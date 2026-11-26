@@ -50,5 +50,8 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.6.9"
+  },
+  "dependencies": {
+    "node-api-headers": "^1.9.0"
   }
 }

@@ -63,16 +63,19 @@ npx anybind-stubgen build/example.node example.d.ts
 - [ ] `std::vector`, `std::optional`, `std::variant`, `std::function`, `bigint`
 - [ ] TypedArray / ArrayBuffer zero-copy views
 - [ ] Async: thread-safe functions, C++20 coroutines ↔ Promise
-- [ ] Windows support
+- [x] Windows support (MSVC; delay-loaded, so addons also load in Electron and other hosts)
 - [ ] CI across Node.js, Bun, Deno, Electron, React Native, HarmonyOS
 
 ## Development
 
 ```sh
-npm test   # configures CMake, builds tests/test_basic.node, runs node --test
+npm ci
+npm test   # configures CMake, builds the test addons, runs node --test
 ```
 
-Requires CMake ≥ 3.21, a C++17 compiler, and Node.js ≥ 18 (with headers).
+Requires CMake ≥ 3.21, a C++17 compiler (MSVC or clang-cl on Windows), and Node.js ≥ 18.
+Node-API headers come from the [`node-api-headers`](https://github.com/nodejs/node-api-headers)
+package, so no Node.js source headers need to be installed.
 
 ## License
 
