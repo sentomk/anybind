@@ -5,6 +5,7 @@
 #include <anybind/anybind.h>
 #include <stdint.h>
 
+#include <map>
 #include <optional>
 #include <string>
 #include <variant>
@@ -47,11 +48,31 @@ struct CustomKeys {
   int count = 0;
 };
 
+/* Counts copies so tests can check that converted arguments are moved, not copied. */
+static int g_tracked_copies = 0;
+
+struct Tracked {
+  int n = 0;
+  Tracked() = default;
+  Tracked(const Tracked& other) : n(other.n) { ++g_tracked_copies; }
+  Tracked(Tracked&& other) noexcept : n(other.n) {}
+  Tracked& operator=(const Tracked& other) {
+    n = other.n;
+    ++g_tracked_copies;
+    return *this;
+  }
+  Tracked& operator=(Tracked&& other) noexcept {
+    n = other.n;
+    return *this;
+  }
+};
+
 ANYBIND_STRUCT(Point, x, y);
 ANYBIND_STRUCT(User, name, age, bio);
 ANYBIND_STRUCT_DEFAULTS(RenderOptions, gfm, xhtml, tabWidth, baseUrl);
 ANYBIND_STRUCT(Polygon, id, origin, vertices);
 ANYBIND_STRUCT(LocalFlag, enabled);
+ANYBIND_STRUCT(Tracked, n);
 
 namespace anybind {
 template <>
@@ -86,4 +107,16 @@ ANYBIND_MODULE(test_struct, m) {
       "flipLocal", [](LocalFlag f) { return LocalFlag{!f.enabled}; }, "flag"_a);
   m.def(
       "echoCustom", [](const CustomKeys& c) { return c; }, "c"_a);
+
+  // Every way of receiving an argument must avoid copying the converted value.
+  m.def("trackedCopies", [] { return g_tracked_copies; });
+  m.def("trackedByValue", [](Tracked t) { return t.n; });
+  m.def("trackedByConstRef", [](const Tracked& t) { return t.n; });
+  m.def("trackedByRef", [](Tracked& t) { return ++t.n; });
+  m.def("trackedByRvalue", [](Tracked&& t) {
+    Tracked owned(std::move(t));
+    return owned.n;
+  });
+  m.def("trackedVector", [](std::vector<Tracked> v) { return static_cast<int>(v.size()); });
+  m.def("trackedMap", [](std::map<std::string, Tracked> v) { return static_cast<int>(v.size()); });
 }

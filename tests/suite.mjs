@@ -822,4 +822,20 @@ export function registerTests(test) {
       /export function echoCustom\(c: \{ "kebab-key": string; count: number \}\): \{ "kebab-key": string; count: number \};/,
     );
   });
+
+  test("moves converted arguments into the bound function instead of copying", () => {
+    const st = require(
+      fileURLToPath(
+        new URL("../build/tests/test_struct.node", import.meta.url),
+      ),
+    );
+    const before = st.trackedCopies();
+    assert.equal(st.trackedByValue({ n: 1 }), 1);
+    assert.equal(st.trackedByConstRef({ n: 2 }), 2);
+    assert.equal(st.trackedByRef({ n: 3 }), 4);
+    assert.equal(st.trackedByRvalue({ n: 5 }), 5);
+    assert.equal(st.trackedVector([{ n: 1 }, { n: 2 }, { n: 3 }]), 3);
+    assert.equal(st.trackedMap({ a: { n: 1 }, b: { n: 2 } }), 2);
+    assert.equal(st.trackedCopies() - before, 0);
+  });
 }

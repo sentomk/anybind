@@ -886,11 +886,15 @@ Map map_from_js(napi_env env, napi_value value) {
     std::string key = type_caster<std::string>::from_js(env, js_key);
     napi_value js_val = nullptr;
     check(env, napi_get_property(env, value, js_key, &js_val));
-    try {
-      result.emplace(key, type_caster<elem_t>::from_js(env, js_val));
-    } catch (const type_error& e) {
-      throw type_error("property '" + key + "': " + e.what());
-    }
+    // Convert first so `key` is still intact for the error message.
+    elem_t elem = [&]() -> elem_t {
+      try {
+        return type_caster<elem_t>::from_js(env, js_val);
+      } catch (const type_error& e) {
+        throw type_error("property '" + key + "': " + e.what());
+      }
+    }();
+    result.emplace(std::move(key), std::move(elem));
   }
   return result;
 }
@@ -1308,6 +1312,23 @@ storage_t<T> load_arg(napi_env env, napi_value* argv, size_t argc, size_t index,
   }
 }
 
+/*
+ * Hands a converted argument to the bound function. Each stored value is used
+ * exactly once, so by-value and rvalue-reference parameters receive it by
+ * move instead of a copy; lvalue-reference parameters bind to the stored
+ * value. View types (`std::string_view`) are rebuilt from their owning
+ * storage by `caster_storage::unwrap` and returned by value.
+ */
+template <typename A, typename S>
+decltype(auto) forward_arg(S& stored) {
+  using T = intrinsic_t<A>;
+  if constexpr (std::is_lvalue_reference_v<A> || !std::is_same_v<S, T>) {
+    return caster_storage<T>::unwrap(stored);
+  } else {
+    return std::move(stored);
+  }
+}
+
 template <typename R, typename F, typename SlotsTuple, typename... A, size_t... I>
 napi_value call(napi_env env, F& f, [[maybe_unused]] napi_value* argv, [[maybe_unused]] size_t argc,
                 [[maybe_unused]] const SlotsTuple& slots, type_list<A...>,
@@ -1316,13 +1337,12 @@ napi_value call(napi_env env, F& f, [[maybe_unused]] napi_value* argv, [[maybe_u
   [[maybe_unused]] std::tuple<storage_t<A>...> values{
       load_arg<intrinsic_t<A>>(env, argv, argc, I, std::get<I>(slots))...};
   if constexpr (std::is_void_v<R>) {
-    f(caster_storage<intrinsic_t<A>>::unwrap(std::get<I>(values))...);
+    f(forward_arg<A>(std::get<I>(values))...);
     napi_value undefined;
     check(env, napi_get_undefined(env, &undefined));
     return undefined;
   } else {
-    return type_caster<intrinsic_t<R>>::to_js(
-        env, f(caster_storage<intrinsic_t<A>>::unwrap(std::get<I>(values))...));
+    return type_caster<intrinsic_t<R>>::to_js(env, f(forward_arg<A>(std::get<I>(values))...));
   }
 }
 
