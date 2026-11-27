@@ -1,7 +1,7 @@
 #include <anybind/anybind.h>
+#include <stdint.h>
 
 #include <cmath>
-#include <cstdint>
 #include <stdexcept>
 #include <string>
 
@@ -26,7 +26,7 @@ ANYBIND_MODULE(test_basic, m) {
   m.def("scale", [](double x, float k) { return x * k; });
   m.def("greet", [](const std::string& who) { return "hello, " + who; });
   m.def("negate", [](bool b) { return !b; });
-  m.def("twice64", [](std::int64_t v) { return v * 2; });
+  m.def("twice64", [](int64_t v) { return v * 2; });
   m.def("noop", [] {});
   m.def("fail", [] { throw std::runtime_error("boom"); });
   m.def("rejectArg", [](int) -> int { throw anybind::type_error("custom type error"); });
@@ -35,6 +35,6 @@ ANYBIND_MODULE(test_basic, m) {
       "keywords", [](int a, int b, int c, int d) { return a + b + c + d; }, "default"_a, "this"_a,
       "my-arg"_a, "2d"_a);
   m.def(
-      "fits", [](float a, std::uint8_t b, std::int64_t c) { return a + b + c; }, "a"_a = 2,
+      "fits", [](float a, uint8_t b, int64_t c) { return a + b + c; }, "a"_a = 2,
       "b"_a = 255, "c"_a = -1);
 }

@@ -8,10 +8,10 @@
 #define NAPI_VERSION 8
 #endif
 #include <node_api.h>
+#include <stddef.h>
+#include <stdint.h>
 
 #include <cmath>
-#include <cstddef>
-#include <cstdint>
 #include <exception>
 #include <limits>
 #include <optional>
@@ -67,7 +67,7 @@ struct arg {
 };
 
 namespace literals {
-inline arg operator""_a(const char* name, std::size_t) { return arg(name); }
+inline arg operator""_a(const char* name, size_t) { return arg(name); }
 }  // namespace literals
 
 /* === TypeScript type descriptors === */
@@ -608,7 +608,7 @@ bool arithmetic_value_fits(V v) {
     if constexpr (LV::digits <= LT::digits) {
       return true;
     } else {
-      using wide = std::conditional_t<std::is_signed_v<V>, std::intmax_t, std::uintmax_t>;
+      using wide = std::conditional_t<std::is_signed_v<V>, intmax_t, uintmax_t>;
       const wide limit = wide{1} << LT::digits;  // LT::digits < LV::digits, so no overflow
       const wide w = static_cast<wide>(v);
       if constexpr (std::is_signed_v<V>) {
