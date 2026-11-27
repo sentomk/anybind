@@ -7,9 +7,12 @@
 #include <stdint.h>
 
 #include <array>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <variant>
 #include <vector>
 
 ANYBIND_MODULE(test_stl, m) {
@@ -97,4 +100,45 @@ ANYBIND_MODULE(test_stl, m) {
       "v"_a, "k"_a = 1.0);
   m.def("emptyArr", [](std::array<int, 0> a) { return a; }, "a"_a);
   m.def("bigArr", [](std::array<int, 20> a) { return a; }, "a"_a);
+
+  // `std::map` and `std::unordered_map` <-> `Record<string, V>`.
+  m.def(
+      "sumMap",
+      [](const std::map<std::string, int>& scores) {
+        int total = 0;
+        for (const auto& [k, v] : scores) {
+          (void)k;
+          total += v;
+        }
+        return total;
+      },
+      "scores"_a);
+  m.def(
+      "echoGroups",
+      [](const std::unordered_map<std::string, std::vector<int>>& groups) { return groups; },
+      "groups"_a);
+
+  // `std::variant` and `std::monostate` <-> union types.
+  using SqlVal = std::variant<std::monostate, int, std::string>;
+  m.def(
+      "describeVariant",
+      [](const SqlVal& v) -> std::string {
+        if (std::holds_alternative<std::monostate>(v)) return "null";
+        if (std::holds_alternative<int>(v)) return "int:" + std::to_string(std::get<int>(v));
+        return "str:" + std::get<std::string>(v);
+      },
+      "v"_a);
+  m.def(
+      "echoSql", [](const SqlVal& v) { return v; }, "v"_a);
+  m.def(
+      "intOrDouble",
+      [](const std::variant<int, double>& v) -> std::string {
+        return std::holds_alternative<int>(v) ? "int" : "double";
+      },
+      "v"_a);
+  m.def(
+      "bigOrDouble", [](const std::variant<int64_t, double>& v) { return v; }, "v"_a);
+  m.def(
+      "listVariant",
+      [](const std::variant<std::vector<int>, std::vector<std::string>>& v) { return v; }, "v"_a);
 }

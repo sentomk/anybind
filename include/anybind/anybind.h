@@ -16,6 +16,7 @@
 #include <cmath>
 #include <exception>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -25,6 +26,7 @@
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #define ANYBIND_VERSION_MAJOR 0
@@ -664,6 +666,25 @@ struct ts_serializer<anybind::ts::tuple<Ts...>> {
   }
 };
 
+template <typename Node, ts_dir Dir>
+struct ts_union_collector {
+  static void collect(std::vector<std::string>& parts, const ts_context& ctx) {
+    std::string part;
+    ts_write_wrapped<Node, Dir, 1>(part, ctx);
+    for (const auto& existing : parts) {
+      if (existing == part) return;
+    }
+    parts.push_back(std::move(part));
+  }
+};
+
+template <ts_dir Dir, typename... Ts>
+struct ts_union_collector<anybind::ts::union_<Ts...>, Dir> {
+  static void collect(std::vector<std::string>& parts, [[maybe_unused]] const ts_context& ctx) {
+    (ts_union_collector<ts_resolve_t<Ts, Dir>, Dir>::collect(parts, ctx), ...);
+  }
+};
+
 template <typename... Ts>
 struct ts_serializer<anybind::ts::union_<Ts...>> {
   template <ts_dir Dir>
@@ -671,13 +692,17 @@ struct ts_serializer<anybind::ts::union_<Ts...>> {
     if constexpr (sizeof...(Ts) == 0) {
       out += "never";
     } else {
-      size_t i = 0;
-      auto append_member = [&](auto tag) {
-        using Member = typename decltype(tag)::type;
-        if (i++ > 0) out += " | ";
-        ts_write_wrapped<Member, Dir, 1>(out, ctx);
-      };
-      (append_member(type_tag<Ts>{}), ...);
+      std::vector<std::string> parts;
+      parts.reserve(sizeof...(Ts));
+      (ts_union_collector<ts_resolve_t<Ts, Dir>, Dir>::collect(parts, ctx), ...);
+      if (parts.empty()) {
+        out += "never";
+        return;
+      }
+      for (size_t i = 0; i < parts.size(); ++i) {
+        if (i > 0) out += " | ";
+        out += parts[i];
+      }
     }
   }
 };
@@ -789,6 +814,133 @@ std::string ts_format(ts_dir dir = ts_dir::out, const ts_context& ctx = {}) {
   }
   return out;
 }
+
+/* === Map and variant casters === */
+
+inline void expect_plain_object(napi_env env, napi_value value) {
+  expect_type(env, value, napi_object, "object");
+  bool is_arr = false;
+  check(env, napi_is_array(env, value, &is_arr));
+  if (is_arr) throw type_error("expected object");
+}
+
+template <typename Map, typename V>
+Map map_from_js(napi_env env, napi_value value) {
+  using elem_t = intrinsic_t<V>;
+  expect_plain_object(env, value);
+  napi_value keys = nullptr;
+  check(env, napi_get_all_property_names(
+                 env, value, napi_key_own_only,
+                 static_cast<napi_key_filter>(napi_key_enumerable | napi_key_skip_symbols),
+                 napi_key_numbers_to_strings, &keys));
+  uint32_t len = 0;
+  check(env, napi_get_array_length(env, keys, &len));
+  Map result;
+  for (uint32_t i = 0; i < len; ++i) {
+    napi_value js_key = nullptr;
+    check(env, napi_get_element(env, keys, i, &js_key));
+    std::string key = type_caster<std::string>::from_js(env, js_key);
+    napi_value js_val = nullptr;
+    check(env, napi_get_property(env, value, js_key, &js_val));
+    try {
+      result.emplace(key, type_caster<elem_t>::from_js(env, js_val));
+    } catch (const type_error& e) {
+      throw type_error("property '" + key + "': " + e.what());
+    }
+  }
+  return result;
+}
+
+template <typename Map, typename V>
+napi_value map_to_js(napi_env env, const Map& value) {
+  using elem_t = intrinsic_t<V>;
+  napi_value obj = nullptr;
+  check(env, napi_create_object(env, &obj));
+  for (const auto& [k, v] : value) {
+    napi_value js_key = nullptr;
+    check(env, napi_create_string_utf8(env, k.data(), k.size(), &js_key));
+    napi_value js_val = type_caster<elem_t>::to_js(env, v);
+    check(env, napi_set_property(env, obj, js_key, js_val));
+  }
+  return obj;
+}
+
+template <typename V, typename Compare, typename Alloc>
+struct type_caster<std::map<std::string, V, Compare, Alloc>> {
+  using map_t = std::map<std::string, V, Compare, Alloc>;
+  using ts = anybind::ts::record<anybind::ts::string, ts_of<V>>;
+  static map_t from_js(napi_env env, napi_value value) { return map_from_js<map_t, V>(env, value); }
+  static napi_value to_js(napi_env env, const map_t& value) {
+    return map_to_js<map_t, V>(env, value);
+  }
+};
+
+template <typename V, typename Hash, typename KeyEqual, typename Alloc>
+struct type_caster<std::unordered_map<std::string, V, Hash, KeyEqual, Alloc>> {
+  using map_t = std::unordered_map<std::string, V, Hash, KeyEqual, Alloc>;
+  using ts = anybind::ts::record<anybind::ts::string, ts_of<V>>;
+  static map_t from_js(napi_env env, napi_value value) { return map_from_js<map_t, V>(env, value); }
+  static napi_value to_js(napi_env env, const map_t& value) {
+    return map_to_js<map_t, V>(env, value);
+  }
+};
+
+template <>
+struct type_caster<std::monostate> {
+  using ts = anybind::ts::null;
+  static std::monostate from_js(napi_env env, napi_value value) {
+    expect_type(env, value, napi_null, "null");
+    return std::monostate{};
+  }
+  static napi_value to_js(napi_env env, std::monostate) {
+    napi_value n = nullptr;
+    check(env, napi_get_null(env, &n));
+    return n;
+  }
+};
+
+template <typename... Ts>
+struct type_caster<std::variant<Ts...>> {
+  using variant_t = std::variant<Ts...>;
+  using ts = anybind::ts::union_<ts_of<Ts>...>;
+
+  template <size_t I>
+  static bool try_alternative(napi_env env, napi_value value, std::optional<variant_t>& out) {
+    if (out.has_value()) return true;
+    using Alt = std::variant_alternative_t<I, variant_t>;
+    try {
+      out.emplace(std::in_place_index<I>, type_caster<intrinsic_t<Alt>>::from_js(env, value));
+      return true;
+    } catch (const type_error&) {
+      return false;
+    }
+  }
+
+  template <size_t... I>
+  static variant_t from_js_impl(napi_env env, napi_value value, std::index_sequence<I...>) {
+    std::optional<variant_t> out;
+    (void)(try_alternative<I>(env, value, out) || ...);
+    if (!out.has_value()) {
+      throw type_error("expected " + ts_format<ts>(ts_dir::in));
+    }
+    return std::move(*out);
+  }
+
+  static variant_t from_js(napi_env env, napi_value value) {
+    return from_js_impl(env, value, std::index_sequence_for<Ts...>{});
+  }
+
+  static napi_value to_js(napi_env env, const variant_t& value) {
+    if (value.valueless_by_exception()) {
+      throw std::runtime_error("anybind: variant is valueless by exception");
+    }
+    return std::visit(
+        [env](const auto& alt) -> napi_value {
+          return type_caster<intrinsic_t<decltype(alt)>>::to_js(env, alt);
+        },
+        value);
+  }
+};
 
 /* === Per-environment type registry === */
 

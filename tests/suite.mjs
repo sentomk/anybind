@@ -546,6 +546,85 @@ export function registerTests(test) {
     );
   });
 
+  test("converts std::map, std::unordered_map, and std::variant", () => {
+    const stl = require(
+      fileURLToPath(new URL("../build/tests/test_stl.node", import.meta.url)),
+    );
+
+    // std::map and std::unordered_map
+    assert.equal(stl.sumMap({ a: 1, b: 2, c: 3 }), 6);
+    assert.equal(stl.sumMap({}), 0);
+    const withProto = Object.assign(Object.create({ ignored: 999 }), { x: 4 });
+    Object.defineProperty(withProto, "hidden", {
+      value: 50,
+      enumerable: false,
+    });
+    withProto[Symbol("s")] = 100;
+    assert.equal(stl.sumMap(withProto), 4);
+    assert.deepEqual(stl.echoGroups({ odd: [1, 3], even: [2, 4] }), {
+      odd: [1, 3],
+      even: [2, 4],
+    });
+    assert.throws(() => stl.sumMap([1, 2]), {
+      name: "TypeError",
+      message: /argument 1 \(scores\): expected object/,
+    });
+    assert.throws(() => stl.sumMap(null), TypeError);
+    assert.throws(() => stl.sumMap({ ok: 1, bad: "x" }), {
+      name: "TypeError",
+      message: /argument 1 \(scores\): property 'bad': expected number/,
+    });
+
+    // std::variant and std::monostate
+    assert.equal(stl.describeVariant(null), "null");
+    assert.equal(stl.describeVariant(42), "int:42");
+    assert.equal(stl.describeVariant("hi"), "str:hi");
+    assert.equal(stl.echoSql(null), null);
+    assert.equal(stl.echoSql(7), 7);
+    assert.equal(stl.echoSql("ok"), "ok");
+    assert.throws(() => stl.describeVariant(true), {
+      name: "TypeError",
+      message: /argument 1 \(v\): expected null \| number \| string/,
+    });
+
+    assert.equal(stl.intOrDouble(5), "int");
+    assert.equal(stl.intOrDouble(5.5), "double");
+    assert.equal(stl.bigOrDouble(10n), 10n);
+    assert.equal(stl.bigOrDouble(2.5), 2.5);
+    assert.deepEqual(stl.listVariant([1, 2]), [1, 2]);
+    assert.deepEqual(stl.listVariant(["a", "b"]), ["a", "b"]);
+    assert.throws(() => stl.listVariant([1, "a"]), {
+      name: "TypeError",
+      message: /argument 1 \(v\): expected number\[\] \| string\[\]/,
+    });
+
+    // Generated .d.ts signatures (including union deduplication)
+    assert.match(
+      stl.__anybind_dts__,
+      /export function sumMap\(scores: Record<string, number>\): number;/,
+    );
+    assert.match(
+      stl.__anybind_dts__,
+      /export function echoGroups\(groups: Record<string, number\[\]>\): Record<string, number\[\]>;/,
+    );
+    assert.match(
+      stl.__anybind_dts__,
+      /export function echoSql\(v: null \| number \| string\): null \| number \| string;/,
+    );
+    assert.match(
+      stl.__anybind_dts__,
+      /export function intOrDouble\(v: number\): string;/,
+    );
+    assert.match(
+      stl.__anybind_dts__,
+      /export function bigOrDouble\(v: number \| bigint\): bigint \| number;/,
+    );
+    assert.match(
+      stl.__anybind_dts__,
+      /export function listVariant\(v: number\[\] \| string\[\]\): number\[\] \| string\[\];/,
+    );
+  });
+
   test("converts 64-bit integers with bigint and safe JS numbers", () => {
     const bi = require(
       fileURLToPath(
