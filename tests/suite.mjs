@@ -36,7 +36,7 @@ export function registerTests(test) {
     assert.equal(m.scale(1.5, 2), 3);
     assert.equal(m.greet("anybind"), "hello, anybind");
     assert.equal(m.negate(true), false);
-    assert.equal(m.twice64(2 ** 40), 2 ** 41);
+    assert.equal(m.twice64(2 ** 40), 2n ** 41n);
     assert.equal(m.noop(), undefined);
   });
 
@@ -543,6 +543,81 @@ export function registerTests(test) {
     assert.match(
       stl.__anybind_dts__,
       /export function bigArr\(a: number\[\]\): number\[\];/,
+    );
+  });
+
+  test("converts 64-bit integers with bigint and safe JS numbers", () => {
+    const bi = require(
+      fileURLToPath(
+        new URL("../build/tests/test_bigint.node", import.meta.url),
+      ),
+    );
+
+    const I64_MIN = -(1n << 63n);
+    const I64_MAX = (1n << 63n) - 1n;
+    const U64_MAX = (1n << 64n) - 1n;
+
+    // Defaults and full 64-bit precision round-trips.
+    assert.equal(bi.echoI64(), -1n);
+    assert.equal(bi.echoI64(I64_MIN), I64_MIN);
+    assert.equal(bi.echoI64(I64_MAX), I64_MAX);
+    assert.equal(bi.echoI64(Number.MAX_SAFE_INTEGER), 9007199254740991n);
+    assert.equal(bi.echoI64(Number.MIN_SAFE_INTEGER), -9007199254740991n);
+
+    assert.equal(bi.echoU64(), U64_MAX);
+    assert.equal(bi.echoU64(0), 0n);
+    assert.equal(bi.echoU64(-0), 0n);
+    assert.equal(bi.echoU64(U64_MAX), U64_MAX);
+    assert.equal(bi.echoU64(Number.MAX_SAFE_INTEGER), 9007199254740991n);
+
+    // Mixing safe numbers and bigints in arithmetic.
+    assert.equal(bi.addI64(10, 9007199254740993n), 9007199254741003n);
+    assert.equal(bi.addU64(1n << 62n, 42), (1n << 62n) + 42n);
+
+    // Composition with std::vector and std::optional.
+    assert.deepEqual(bi.incAllI64([1, 9007199254740993n, -10]), [
+      2n,
+      9007199254740994n,
+      -9n,
+    ]);
+    assert.equal(bi.optU64(), undefined);
+    assert.equal(bi.optU64(100), 100n);
+    assert.equal(bi.optU64(U64_MAX), U64_MAX);
+
+    // Reject out-of-range bigints, unsafe/fractional numbers, and bad types.
+    assert.throws(() => bi.echoI64(I64_MAX + 1n), {
+      name: "TypeError",
+      message: /argument 1 \(v\): expected a 64-bit signed integer/,
+    });
+    assert.throws(() => bi.echoI64(I64_MIN - 1n), TypeError);
+    assert.throws(() => bi.echoU64(-1n), {
+      name: "TypeError",
+      message: /argument 1 \(v\): expected a 64-bit unsigned integer/,
+    });
+    assert.throws(() => bi.echoU64(U64_MAX + 1n), TypeError);
+    assert.throws(() => bi.echoU64(-1), TypeError);
+    assert.throws(() => bi.echoI64(Number.MAX_SAFE_INTEGER + 1), TypeError);
+    assert.throws(() => bi.echoI64(Number.MIN_SAFE_INTEGER - 1), TypeError);
+    assert.throws(() => bi.echoI64(1.5), TypeError);
+    assert.throws(() => bi.echoI64(Number.NaN), TypeError);
+    assert.throws(() => bi.echoI64(Infinity), TypeError);
+    assert.throws(() => bi.echoI64("123"), {
+      name: "TypeError",
+      message: /argument 1 \(v\): expected number or bigint/,
+    });
+
+    // Generated .d.ts uses asymmetric `number | bigint` -> `bigint`.
+    assert.match(
+      bi.__anybind_dts__,
+      /export function echoI64\(v\?: number \| bigint\): bigint;/,
+    );
+    assert.match(
+      bi.__anybind_dts__,
+      /export function incAllI64\(nums: \(number \| bigint\)\[\]\): bigint\[\];/,
+    );
+    assert.match(
+      bi.__anybind_dts__,
+      /export function optU64\(v\?: number \| bigint \| undefined\): bigint \| undefined;/,
     );
   });
 }

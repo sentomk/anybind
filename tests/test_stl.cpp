@@ -17,7 +17,8 @@ ANYBIND_MODULE(test_stl, m) {
 
   // `std::string_view` parameter, default value and return (including empty view).
   m.def(
-      "svLen", [](std::string_view s) { return s.size(); }, "s"_a = "world");
+      "svLen", [](std::string_view s) { return static_cast<uint32_t>(s.size()); },
+      "s"_a = "world");
   m.def(
       "svTrimPrefix",
       [](std::string_view s, std::string_view prefix) -> std::string_view {

@@ -69,7 +69,7 @@ with this?_ It ships only once every release criterion below is met.
 2. **Type system**
    - [ ] `std::vector` / `std::array` ↔ `Array`, `std::optional` ↔ `T | undefined`,
          `std::variant` ↔ union, `std::map` / plain structs ↔ objects, `std::string_view`
-   - [ ] 64-bit integers ↔ `bigint`
+   - [x] 64-bit integers ↔ `bigint`
    - [ ] Synchronous callbacks: `std::function` ↔ JS functions
    - [ ] Function overloads, emitted as TypeScript overloads
 3. **Classes**

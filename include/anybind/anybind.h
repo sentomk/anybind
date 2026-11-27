@@ -217,7 +217,8 @@ struct type_caster<bool> {
 };
 
 template <typename T>
-struct type_caster<T, std::enable_if_t<std::is_arithmetic_v<T> && !std::is_same_v<T, bool>>> {
+struct type_caster<T, std::enable_if_t<std::is_arithmetic_v<T> && !std::is_same_v<T, bool> &&
+                                       (!std::is_integral_v<T> || sizeof(T) <= 4)>> {
   using ts = anybind::ts::number;
   static T from_js(napi_env env, napi_value value) {
     expect_type(env, value, napi_number, "number");
@@ -243,13 +244,68 @@ struct type_caster<T, std::enable_if_t<std::is_arithmetic_v<T> && !std::is_same_
   }
   static napi_value to_js(napi_env env, T value) {
     napi_value result;
-    if constexpr (std::is_integral_v<T> && std::is_signed_v<T> && sizeof(T) <= 4) {
+    if constexpr (std::is_integral_v<T> && std::is_signed_v<T>) {
       check(env, napi_create_int32(env, static_cast<int32_t>(value), &result));
-    } else if constexpr (std::is_integral_v<T> && std::is_unsigned_v<T> && sizeof(T) <= 4) {
+    } else if constexpr (std::is_integral_v<T> && std::is_unsigned_v<T>) {
       check(env, napi_create_uint32(env, static_cast<uint32_t>(value), &result));
     } else {
-      // TODO: map 64-bit integers outside +-2^53 to bigint.
       check(env, napi_create_double(env, static_cast<double>(value), &result));
+    }
+    return result;
+  }
+};
+
+/*
+ * 64-bit integer caster: accepts lossless JS safe numbers or bigints as
+ * parameters (`number | bigint`) and always returns `bigint` to preserve full
+ * 64-bit precision.
+ */
+template <typename T>
+struct type_caster<T, std::enable_if_t<std::is_integral_v<T> && !std::is_same_v<T, bool> &&
+                                       sizeof(T) == 8>> {
+  using ts = anybind::ts::io<anybind::ts::union_<anybind::ts::number, anybind::ts::bigint>,
+                             anybind::ts::bigint>;
+  static T from_js(napi_env env, napi_value value) {
+    napi_valuetype actual;
+    check(env, napi_typeof(env, value, &actual));
+    if (actual == napi_bigint) {
+      bool lossless = false;
+      if constexpr (std::is_signed_v<T>) {
+        int64_t result = 0;
+        check(env, napi_get_value_bigint_int64(env, value, &result, &lossless));
+        if (!lossless) {
+          throw type_error("expected a 64-bit signed integer (bigint out of range)");
+        }
+        return static_cast<T>(result);
+      } else {
+        uint64_t result = 0;
+        check(env, napi_get_value_bigint_uint64(env, value, &result, &lossless));
+        if (!lossless) {
+          throw type_error("expected a 64-bit unsigned integer (bigint out of range)");
+        }
+        return static_cast<T>(result);
+      }
+    }
+    if (actual == napi_number) {
+      double d = 0.0;
+      check(env, napi_get_value_double(env, value, &d));
+      // Only JS safe integers [-(2^53 - 1), 2^53 - 1] convert losslessly from number.
+      constexpr double kMaxSafeInt = 9007199254740991.0;
+      const double lo = std::is_signed_v<T> ? -kMaxSafeInt : 0.0;
+      if (!(d >= lo && d <= kMaxSafeInt) || std::trunc(d) != d) {
+        throw type_error(
+            "expected a safe integer or bigint in the range of the C++ parameter type");
+      }
+      return static_cast<T>(d);
+    }
+    throw type_error("expected number or bigint");
+  }
+  static napi_value to_js(napi_env env, T value) {
+    napi_value result = nullptr;
+    if constexpr (std::is_signed_v<T>) {
+      check(env, napi_create_bigint_int64(env, static_cast<int64_t>(value), &result));
+    } else {
+      check(env, napi_create_bigint_uint64(env, static_cast<uint64_t>(value), &result));
     }
     return result;
   }
