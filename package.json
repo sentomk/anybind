@@ -40,7 +40,7 @@
   },
   "scripts": {
     "build:test": "cmake -S . -B build -DANYBIND_BUILD_TESTS=ON && cmake --build build",
-    "test": "npm run build:test && node --test tests/basic.test.mjs",
+    "test": "npm run build:test && node --test tests/basic.test.mjs tests/compile_fail.test.mjs",
     "lint": "biome check .",
     "format": "biome check --write ."
   },

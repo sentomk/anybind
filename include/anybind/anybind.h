@@ -369,6 +369,47 @@ struct caster_storage<std::optional<T>,
 template <typename T>
 using storage_t = typename caster_storage<intrinsic_t<T>>::type;
 
+/*
+ * Whether `T` holds a non-owning view (`std::string_view`) anywhere inside it.
+ * `caster_storage` only keeps the viewed data alive for a top-level parameter,
+ * so converting JS into a view nested in a container, or returning one from
+ * `value::as<T>()`, would leave it pointing at a destroyed temporary.
+ */
+template <typename T>
+struct contains_view : std::false_type {};
+
+template <>
+struct contains_view<std::string_view> : std::true_type {};
+
+template <typename T>
+struct contains_view<std::optional<T>> : contains_view<intrinsic_t<T>> {};
+
+template <typename T, typename Alloc>
+struct contains_view<std::vector<T, Alloc>> : contains_view<intrinsic_t<T>> {};
+
+template <typename T, size_t N>
+struct contains_view<std::array<T, N>> : contains_view<intrinsic_t<T>> {};
+
+template <typename K, typename V, typename Compare, typename Alloc>
+struct contains_view<std::map<K, V, Compare, Alloc>>
+    : std::disjunction<contains_view<intrinsic_t<K>>, contains_view<intrinsic_t<V>>> {};
+
+template <typename K, typename V, typename Hash, typename KeyEqual, typename Alloc>
+struct contains_view<std::unordered_map<K, V, Hash, KeyEqual, Alloc>>
+    : std::disjunction<contains_view<intrinsic_t<K>>, contains_view<intrinsic_t<V>>> {};
+
+template <typename... Ts>
+struct contains_view<std::variant<Ts...>> : std::disjunction<contains_view<intrinsic_t<Ts>>...> {};
+
+template <typename T>
+inline constexpr bool contains_view_v = contains_view<intrinsic_t<T>>::value;
+
+#define ANYBIND_DETAIL_NO_NESTED_VIEW(Elem)                                                 \
+  static_assert(!::anybind::detail::contains_view_v<Elem>,                                 \
+                "anybind: cannot convert a JS value into a std::string_view nested inside " \
+                "a container, variant, or struct field; the view would dangle. Use "        \
+                "std::string instead.")
+
 template <>
 struct type_caster<std::string_view> {
   using ts = anybind::ts::string;
@@ -408,6 +449,7 @@ struct type_caster<std::vector<T>> {
   using elem_t = intrinsic_t<T>;
   using ts = anybind::ts::array<ts_of<elem_t>>;
   static std::vector<T> from_js(napi_env env, napi_value value) {
+    ANYBIND_DETAIL_NO_NESTED_VIEW(elem_t);
     bool is_arr = false;
     check(env, napi_is_array(env, value, &is_arr));
     if (!is_arr) throw type_error("expected array");
@@ -467,6 +509,7 @@ struct type_caster<std::array<T, N>> {
   using elem_t = intrinsic_t<T>;
   using ts = typename ts_fixed_array<ts_of<elem_t>, N>::type;
   static std::array<T, N> from_js(napi_env env, napi_value value) {
+    ANYBIND_DETAIL_NO_NESTED_VIEW(elem_t);
     bool is_arr = false;
     check(env, napi_is_array(env, value, &is_arr));
     if (!is_arr) throw type_error("expected array");
@@ -827,6 +870,7 @@ inline void expect_plain_object(napi_env env, napi_value value) {
 template <typename Map, typename V>
 Map map_from_js(napi_env env, napi_value value) {
   using elem_t = intrinsic_t<V>;
+  ANYBIND_DETAIL_NO_NESTED_VIEW(elem_t);
   expect_plain_object(env, value);
   napi_value keys = nullptr;
   check(env, napi_get_all_property_names(
@@ -927,6 +971,8 @@ struct type_caster<std::variant<Ts...>> {
   }
 
   static variant_t from_js(napi_env env, napi_value value) {
+    // Unlike a top-level parameter, a view alternative has no owning storage.
+    ANYBIND_DETAIL_NO_NESTED_VIEW(variant_t);
     return from_js_impl(env, value, std::index_sequence_for<Ts...>{});
   }
 
@@ -1462,9 +1508,15 @@ class value {
     return eq;
   }
 
-  /** Converts this JS value to C++ type `T` using its `type_caster`. */
+  /**
+   * Converts this JS value to C++ type `T` using its `type_caster`. `T` must
+   * own its data: a returned `std::string_view` would outlive its storage.
+   */
   template <typename T>
   T as() const {
+    static_assert(!detail::contains_view_v<T>,
+                  "anybind::value::as<T>: T must not be or contain std::string_view, which "
+                  "would dangle; use std::string instead.");
     require_handle();
     return detail::type_caster<detail::intrinsic_t<T>>::from_js(env_, raw_);
   }
@@ -1807,9 +1859,7 @@ struct type_caster<T, std::enable_if_t<anybind::struct_traits<T>::is_specialized
   template <typename Field>
   static void read_field(napi_env env, napi_value obj, T& out, const Field& f) {
     using ValT = typename Field::value_type;
-    static_assert(
-        std::is_same_v<storage_t<ValT>, intrinsic_t<ValT>>,
-        "anybind: plain struct fields must be owning types (use std::string, not std::string_view)");
+    ANYBIND_DETAIL_NO_NESTED_VIEW(ValT);
     const char* raw_name = Field::name;
     napi_value js_key = nullptr;
     check(env, napi_create_string_utf8(env, raw_name, NAPI_AUTO_LENGTH, &js_key));

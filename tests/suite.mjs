@@ -466,6 +466,10 @@ export function registerTests(test) {
     assert.equal(stl.svTrimPrefix("pre_hello"), "hello");
     assert.equal(stl.svTrimPrefix("hello", "no_"), "hello");
     assert.equal(stl.svEmpty(), "");
+    assert.deepEqual(stl.svSplit(), ["alpha", "beta"]);
+    assert.deepEqual(stl.svLabels(), { first: "alpha" });
+    assert.equal(stl.svOrInt(true), "beta");
+    assert.equal(stl.svOrInt(false), 7);
 
     // std::optional
     assert.equal(stl.optDouble(), undefined);

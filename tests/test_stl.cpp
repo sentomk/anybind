@@ -15,6 +15,19 @@
 #include <variant>
 #include <vector>
 
+/* Views nested anywhere inside a type are detected (see tests/compile_fail.cpp). */
+using anybind::detail::contains_view_v;
+static_assert(contains_view_v<std::string_view>);
+static_assert(contains_view_v<const std::vector<std::string_view>&>);
+static_assert(contains_view_v<std::vector<std::optional<std::string_view>>>);
+static_assert(contains_view_v<std::array<std::string_view, 2>>);
+static_assert(contains_view_v<std::map<std::string, std::vector<std::string_view>>>);
+static_assert(contains_view_v<std::unordered_map<std::string, std::string_view>>);
+static_assert(contains_view_v<std::variant<int, std::string_view>>);
+static_assert(!contains_view_v<std::string>);
+static_assert(!contains_view_v<std::vector<std::map<std::string, std::optional<int>>>>);
+static_assert(!contains_view_v<std::variant<std::monostate, int, std::string>>);
+
 ANYBIND_MODULE(test_stl, m) {
   using namespace anybind::literals;
 
@@ -32,6 +45,20 @@ ANYBIND_MODULE(test_stl, m) {
       },
       "s"_a, "prefix"_a = std::string_view("pre_"));
   m.def("svEmpty", []() -> std::string_view { return {}; });
+
+  // Returning views nested in containers is safe: they are copied into JS strings.
+  static constexpr char kWords[] = "alpha beta";
+  m.def("svSplit", [] {
+    const std::string_view all(kWords);
+    return std::vector<std::string_view>{all.substr(0, 5), all.substr(6)};
+  });
+  m.def("svLabels", [] {
+    return std::map<std::string, std::string_view>{{"first", std::string_view(kWords, 5)}};
+  });
+  m.def("svOrInt", [](bool text) -> std::variant<std::string_view, int> {
+    if (text) return std::string_view(kWords + 6);
+    return 7;
+  });
 
   // `std::optional<T>` including `std::optional<std::string_view>` and defaults.
   m.def(
