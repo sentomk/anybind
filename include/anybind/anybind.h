@@ -11,6 +11,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -684,6 +685,24 @@ inline bool ts_is_ident(std::string_view s) {
     if (i == 0 ? !letter : !(letter || digit)) return false;
   }
   return true;
+}
+
+/*
+ * ECMAScript reserved words, which TypeScript rejects as function and parameter
+ * names. `this` is included because TS would treat a parameter named `this` as
+ * a `this` parameter and drop it from the arity.
+ */
+inline bool ts_is_reserved_word(std::string_view s) {
+  static constexpr std::string_view reserved[] = {
+      "break",  "case",     "catch",  "class",  "const",  "continue",   "debugger", "default",
+      "delete", "do",       "else",   "enum",   "export", "extends",    "false",    "finally",
+      "for",    "function", "if",     "import", "in",     "instanceof", "new",      "null",
+      "return", "super",    "switch", "this",   "throw",  "true",       "try",      "typeof",
+      "var",    "void",     "while",  "with"};
+  for (std::string_view word : reserved) {
+    if (s == word) return true;
+  }
+  return false;
 }
 
 template <typename Node>
@@ -1510,20 +1529,7 @@ inline std::string ts_param_name(std::string_view name, size_t index) {
     out += ok ? c : '_';
   }
   if (out[0] >= '0' && out[0] <= '9') out.insert(out.begin(), '_');
-  // Words TypeScript rejects as parameter names, plus `this`, which TS would
-  // silently treat as a `this` parameter and drop from the arity.
-  static constexpr std::string_view reserved[] = {
-      "break",  "case",     "catch",  "class",  "const",  "continue",   "debugger", "default",
-      "delete", "do",       "else",   "enum",   "export", "extends",    "false",    "finally",
-      "for",    "function", "if",     "import", "in",     "instanceof", "new",      "null",
-      "return", "super",    "switch", "this",   "throw",  "true",       "try",      "typeof",
-      "var",    "void",     "while",  "with"};
-  for (std::string_view word : reserved) {
-    if (out == word) {
-      out += '_';
-      break;
-    }
-  }
+  if (ts_is_reserved_word(out)) out += '_';
   return out;
 }
 
@@ -1535,16 +1541,24 @@ struct ts_contains<anybind::ts::union_<Ts...>, Target>
     : std::disjunction<ts_contains<Ts, Target>...> {};
 
 template <typename R, typename... A, typename SlotsTuple, size_t... I>
-std::string ts_signature(const char* name, type_list<A...>,
+std::string ts_signature(std::string_view head, type_list<A...>,
                          [[maybe_unused]] const SlotsTuple& slots, [[maybe_unused]] size_t min_args,
                          std::index_sequence<I...>, const ts_context& ctx = {}) {
-  std::string s = "export function ";
-  s += name;
+  std::string s(head);
   s += '(';
+  // TypeScript rejects duplicate parameter names, which can come from repeated
+  // `arg` names or from different names that sanitize to the same identifier.
+  [[maybe_unused]] std::vector<std::string> used;
   [[maybe_unused]] auto append_param = [&](size_t i, const auto& slot, auto tag) {
     using ParamT = typename decltype(tag)::type;
     if (i > 0) s += ", ";
-    s += ts_param_name(slot.name, i);
+    const std::string base = ts_param_name(slot.name, i);
+    std::string param = base;
+    for (size_t n = 2; std::find(used.begin(), used.end(), param) != used.end(); ++n) {
+      param = base + "_" + std::to_string(n);
+    }
+    s += param;
+    used.push_back(std::move(param));
     if (i >= min_args) {
       // Trailing optional parameter.
       s += "?: ";
@@ -2133,8 +2147,10 @@ class module_ {
     auto slots = detail::make_arg_slots(typename traits::args{}, std::forward<Extra>(extra)...);
     size_t min_args = detail::compute_min_args(slots, indices{});
     detail::ts_context ts_ctx{&detail::resolve_bound_type, registry_};
-    std::string sig = detail::ts_signature<typename traits::return_type>(
-        name, typename traits::args{}, slots, min_args, indices{}, ts_ctx);
+    std::string sig = declare_function(name, [&](std::string_view head) {
+      return detail::ts_signature<typename traits::return_type>(
+          head, typename traits::args{}, slots, min_args, indices{}, ts_ctx);
+    });
 
     auto* record = new record_t{std::forward<Func>(f), std::move(slots), min_args};
     napi_value fn;
@@ -2159,10 +2175,51 @@ class module_ {
   const std::string& dts() const { return dts_; }
 
  private:
+  /*
+   * Emits the declaration for export `name`. A valid identifier becomes
+   * `export function name(...)`. A reserved word (`delete`, `default`) or a
+   * name that is not an identifier (`my-fn`) is declared under a private local
+   * name and re-exported with `export { local as name }`; the string form
+   * `export { local as "my-fn" }` needs TypeScript 5.6 or later.
+   */
+  template <typename Sig>
+  std::string declare_function(const char* name, Sig&& signature) {
+    const std::string_view export_name = name ? std::string_view(name) : std::string_view{};
+    const bool ident = detail::ts_is_ident(export_name);
+    if (ident && !detail::ts_is_reserved_word(export_name)) {
+      return signature("export function " + std::string(export_name));
+    }
+    std::string base = "__anybind_";
+    for (char c : export_name) {
+      const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                      c == '_' || c == '$';
+      base += ok ? c : '_';
+    }
+    std::string local = base;
+    for (size_t n = 2; std::find(local_names_.begin(), local_names_.end(), local) !=
+                       local_names_.end();
+         ++n) {
+      local = base + "_" + std::to_string(n);
+    }
+    local_names_.push_back(local);
+    std::string out = signature("declare function " + local);
+    out += "export { ";
+    out += local;
+    out += " as ";
+    if (ident) {
+      out += export_name;
+    } else {
+      detail::ts_append_quoted(out, export_name);
+    }
+    out += " };\n";
+    return out;
+  }
+
   napi_env env_;
   napi_value exports_;
   detail::type_registry* registry_;
   std::string dts_;
+  std::vector<std::string> local_names_;
 };
 
 namespace detail {

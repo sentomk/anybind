@@ -87,6 +87,40 @@ export function registerTests(test) {
     assert.match(m.__anybind_dts__, /export function noop\(\): void;/);
   });
 
+  test("declares reserved and non-identifier export names via aliases", () => {
+    assert.equal(m.delete(1), 2);
+    assert.equal(m["my-fn"](2), 4);
+    assert.equal(m["my.fn"](2), 6);
+    assert.ok(
+      m.__anybind_dts__.includes(
+        "declare function __anybind_delete(arg0: number): number;\n" +
+          "export { __anybind_delete as delete };\n",
+      ),
+    );
+    assert.ok(
+      m.__anybind_dts__.includes(
+        "declare function __anybind_my_fn(arg0: number): number;\n" +
+          'export { __anybind_my_fn as "my-fn" };\n',
+      ),
+    );
+    // "my.fn" sanitizes to the same local name, so it gets a numbered one.
+    assert.ok(
+      m.__anybind_dts__.includes(
+        "declare function __anybind_my_fn_2(arg0: number): number;\n" +
+          'export { __anybind_my_fn_2 as "my.fn" };\n',
+      ),
+    );
+    assert.doesNotMatch(m.__anybind_dts__, /export function (delete|my-fn)/);
+  });
+
+  test("keeps generated parameter names unique", () => {
+    assert.equal(m.dupParams(10, 1, 5, 2), 12);
+    assert.match(
+      m.__anybind_dts__,
+      /export function dupParams\(x: number, x_2: number, my_arg: number, my_arg_2: number\): number;/,
+    );
+  });
+
   test("anybind-stubgen prints the declarations", () => {
     const r = runStubgen(addonPath);
     assert.equal(r.status, 0, r.stderr);

@@ -34,6 +34,13 @@ ANYBIND_MODULE(test_basic, m) {
   m.def(
       "keywords", [](int a, int b, int c, int d) { return a + b + c + d; }, "default"_a, "this"_a,
       "my-arg"_a, "2d"_a);
+  // Export names that are reserved words or not identifiers get an aliased declaration.
+  m.def("delete", [](int v) { return v + 1; });
+  m.def("my-fn", [](int v) { return v * 2; });
+  m.def("my.fn", [](int v) { return v * 3; });
+  m.def(
+      "dupParams", [](int a, int b, int c, int d) { return a - b + c - d; }, "x"_a, "x"_a,
+      "my-arg"_a, "my_arg"_a);
   m.def(
       "fits", [](float a, uint8_t b, int64_t c) { return a + b + c; }, "a"_a = 2,
       "b"_a = 255, "c"_a = -1);
