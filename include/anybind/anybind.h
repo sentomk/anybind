@@ -1137,6 +1137,11 @@ struct type_info {
  * Per-napi_env registry stored via `napi_set_instance_data`, so loading the
  * same addon across worker threads or multiple contexts stays isolated and
  * thread-safe, and every `napi_ref` is released when its environment exits.
+ *
+ * The addon's instance data is reserved for this registry. Its pointer is only
+ * trusted if it matches the registry this module created for the environment,
+ * so instance data replaced by user code is reported instead of misused.
+ * Per-environment user state goes through `anybind::env_data<T>()`.
  */
 class type_registry {
  public:
@@ -1148,21 +1153,47 @@ class type_registry {
   static type_registry& get(napi_env env) {
     void* raw = nullptr;
     check(env, napi_get_instance_data(env, &raw));
-    if (raw != nullptr) return *static_cast<type_registry*>(raw);
+    auto& owned = owned_registries();
+    if (raw != nullptr) {
+      auto it = owned.find(env);
+      if (it != owned.end() && it->second == raw) return *it->second;
+      throw std::runtime_error(
+          "anybind: this addon's Node-API instance data was replaced by "
+          "napi_set_instance_data(), which anybind reserves; store per-environment "
+          "state with anybind::env_data<T>() instead");
+    }
 
-    auto* reg = new type_registry();
-    napi_status status = napi_set_instance_data(env, reg, &type_registry::finalize, nullptr);
+    auto reg = std::make_unique<type_registry>();
+    owned[env] = reg.get();
+    napi_status status = napi_set_instance_data(env, reg.get(), &type_registry::finalize, nullptr);
     if (status != napi_ok) {
-      delete reg;
+      owned.erase(env);
       check(env, status);
     }
-    return *reg;
+    return *reg.release();
   }
 
   static type_registry* try_get(napi_env env) noexcept {
     void* raw = nullptr;
-    if (napi_get_instance_data(env, &raw) != napi_ok) return nullptr;
-    return static_cast<type_registry*>(raw);
+    if (napi_get_instance_data(env, &raw) != napi_ok || raw == nullptr) return nullptr;
+    auto& owned = owned_registries();
+    auto it = owned.find(env);
+    return it != owned.end() && it->second == raw ? it->second : nullptr;
+  }
+
+  /* Per-environment user state backing `anybind::env_data<T>()`. */
+  template <typename T>
+  T& user_data() {
+    const void* id = type_id<T>();
+    for (auto& [key, ptr] : user_data_) {
+      if (key == id) return *static_cast<T*>(ptr.get());
+    }
+    user_data_.reserve(user_data_.size() + 1);
+    std::unique_ptr<void, void (*)(void*)> ptr(new T(),
+                                               [](void* p) { delete static_cast<T*>(p); });
+    T& data = *static_cast<T*>(ptr.get());
+    user_data_.emplace_back(id, std::move(ptr));
+    return data;
   }
 
   /* Takes ownership of `ctor_ref` (if non-null), including on error paths. */
@@ -1212,7 +1243,19 @@ class type_registry {
     return 0x616e7962696e6400ULL ^ (counter.fetch_add(1, std::memory_order_relaxed) + 1);
   }
 
+  /*
+   * Registries this module created, per environment. Every environment runs on
+   * a single JS thread, so a thread-local map needs no locking.
+   */
+  static std::unordered_map<napi_env, type_registry*>& owned_registries() noexcept {
+    thread_local std::unordered_map<napi_env, type_registry*> owned;
+    return owned;
+  }
+
   void cleanup(napi_env env) noexcept {
+    // User state may hold `ref<T>` handles, so release it while the env is usable,
+    // newest first.
+    while (!user_data_.empty()) user_data_.pop_back();
     for (auto& [id, info] : types_) {
       (void)id;
       if (info && info->ctor_ref != nullptr) {
@@ -1225,6 +1268,9 @@ class type_registry {
 
   static void finalize(napi_env env, void* data, void*) noexcept {
     auto* reg = static_cast<type_registry*>(data);
+    auto& owned = owned_registries();
+    auto it = owned.find(env);
+    if (it != owned.end() && it->second == reg) owned.erase(it);
     reg->cleanup(env);
     delete reg;
   }
@@ -1232,6 +1278,7 @@ class type_registry {
   uint64_t env_salt_;
   uint64_t next_tag_id_ = 0;
   std::unordered_map<const void*, std::unique_ptr<type_info>> types_;
+  std::vector<std::pair<const void*, std::unique_ptr<void, void (*)(void*)>>> user_data_;
 };
 
 inline std::string resolve_bound_type(void* user_data, const void* id) {
@@ -1617,6 +1664,28 @@ napi_value to_js_value(napi_env env, T&& v) {
 
 /** TypeScript type descriptor for C++ type `T`. */
 using detail::ts_of;
+
+/**
+ * Per-environment instance of `T`: default-constructed on first use in `env`
+ * and destroyed when that environment shuts down (e.g. when a worker thread
+ * exits). Each worker thread or context gets its own instance.
+ *
+ * Use this instead of `napi_set_instance_data`, which anybind reserves for its
+ * own registry. Only call it on the JS thread that owns `env`.
+ *
+ *  struct Cache { std::map<std::string, int> hits; };
+ *  ANYBIND_MODULE(m_, m) {
+ *    m.def("hit", [env = m.env()](const std::string& k) {
+ *      return ++anybind::env_data<Cache>(env).hits[k];
+ *    });
+ *  }
+ */
+template <typename T>
+T& env_data(napi_env env) {
+  static_assert(std::is_default_constructible_v<T>,
+                "anybind::env_data<T>: T must be default-constructible");
+  return detail::type_registry::get(env).user_data<T>();
+}
 
 /* === Scoped JS handle types === */
 

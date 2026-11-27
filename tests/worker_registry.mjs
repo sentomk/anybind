@@ -14,6 +14,10 @@ assert.match(
 reg.registerGamma();
 assert.equal(reg.hasGamma(), true);
 
+// env_data<T> is per environment: each worker starts from a fresh instance.
+assert.equal(reg.bumpCounter(), 1);
+assert.equal(reg.bumpCounter(), 2);
+
 parentPort.postMessage({
   addr: reg.registryAddr(),
   salt: reg.alphaTagLower(),

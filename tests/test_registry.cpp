@@ -1,10 +1,12 @@
 /*
  * Tests for the per-environment type registry (`napi_set_instance_data`),
- * including worker-thread isolation and live `ts::bound<T>` resolution.
+ * including worker-thread isolation, live `ts::bound<T>` resolution,
+ * `anybind::env_data<T>()`, and detection of replaced instance data.
  */
 #include <anybind/anybind.h>
 #include <stdint.h>
 
+#include <atomic>
 #include <stdexcept>
 #include <string>
 
@@ -13,6 +15,21 @@ namespace {
 struct Alpha {};
 struct Beta {};
 struct Gamma {};
+
+/* Counts destructions, so tests can see env_data<T> released at env teardown. */
+std::atomic<int> g_counters_destroyed{0};
+
+struct Counter {
+  int n = 0;
+  Counter() = default;
+  Counter(const Counter&) = delete;
+  Counter& operator=(const Counter&) = delete;
+  ~Counter() { ++g_counters_destroyed; }
+};
+
+struct Other {
+  int n = 100;
+};
 
 }  // namespace
 
@@ -101,4 +118,16 @@ ANYBIND_MODULE(test_registry, m) {
   });
   m.def("hasGamma", [env] { return type_registry::get(env).find<Gamma>() != nullptr; });
   m.def("registerGamma", [env] { type_registry::get(env).register_type<Gamma>(env, "Gamma"); });
+
+  // Per-environment user state.
+  m.def("bumpCounter", [env] { return ++anybind::env_data<Counter>(env).n; });
+  m.def("bumpOther", [env] { return ++anybind::env_data<Other>(env).n; });
+  m.def("countersDestroyed", [] { return g_counters_destroyed.load(); });
+
+  // Replacing the reserved instance data must be detected, not misused.
+  m.def("clobberInstanceData", [env] {
+    static int foreign = 0;
+    check(env, napi_set_instance_data(env, &foreign, nullptr, nullptr));
+  });
+  m.def("registryTrusted", [env] { return type_registry::try_get(env) != nullptr; });
 }

@@ -12,6 +12,11 @@ const stubgen = fileURLToPath(
   new URL("../bin/anybind-stubgen.mjs", import.meta.url),
 );
 const m = require(addonPath);
+// Plain Node.js (Electron also sets process.versions.node).
+const isNode =
+  typeof globalThis.Bun === "undefined" &&
+  typeof globalThis.Deno === "undefined" &&
+  !process.versions?.electron;
 
 function runStubgen(targetAddon) {
   if (typeof globalThis.Deno !== "undefined") {
@@ -300,6 +305,10 @@ export function registerTests(test) {
       return { worker, ready, done };
     };
 
+    // Main-thread env_data<T> state is separate from every worker's.
+    const mainCount = mainReg.bumpCounter();
+    const destroyedBefore = mainReg.countersDestroyed();
+
     const workers = Array.from({ length: 4 }, spawnWorker);
     let results;
     try {
@@ -321,6 +330,49 @@ export function registerTests(test) {
     assert.equal(salts.size, 5);
     // Registering Gamma inside workers must not leak to the main environment.
     assert.equal(mainReg.hasGamma(), false);
+
+    assert.equal(mainReg.bumpCounter(), mainCount + 1);
+    // Each worker's Counter is destroyed with its environment. Not every
+    // runtime finalizes instance data at worker exit, so only Node is strict.
+    const destroyed = mainReg.countersDestroyed() - destroyedBefore;
+    if (isNode) {
+      assert.equal(destroyed, 4);
+    } else {
+      assert.ok(destroyed <= 4);
+    }
+  });
+
+  test("keeps env_data<T> instances separate per type", () => {
+    const reg = require(
+      fileURLToPath(
+        new URL("../build/tests/test_registry.node", import.meta.url),
+      ),
+    );
+    // Other starts at its default member initializer (100), independent of Counter.
+    assert.equal(reg.bumpOther(), 101);
+    const counter = reg.bumpCounter();
+    assert.equal(reg.bumpOther(), 102);
+    assert.equal(reg.bumpCounter(), counter + 1);
+  });
+
+  test("rejects addon instance data replaced by user code", async () => {
+    const registryPath = fileURLToPath(
+      new URL("../build/tests/test_registry.node", import.meta.url),
+    );
+    // Runs in a worker so the main environment's registry stays intact.
+    const worker = new Worker(
+      new URL("./worker_clobber.mjs", import.meta.url),
+      {
+        workerData: { registryPath },
+      },
+    );
+    await new Promise((resolve, reject) => {
+      worker.once("error", reject);
+      worker.once("exit", (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(`worker exited with code ${code}`));
+      });
+    });
   });
 
   test("supports value, object, and function JS handles", () => {
