@@ -60,7 +60,7 @@ with this?_ It ships only once every release criterion below is met.
      - Done when: all existing types are migrated, the generated `.d.ts` is identical to
        today's, there are tests for nested types and for differing parameter/return
        types, and `npm test` and `biome ci` pass.
-   - [ ] Per-environment type registry via instance data, so the addon works when loaded
+   - [x] Per-environment type registry via instance data, so the addon works when loaded
          several times (worker threads, multiple contexts).
    - [ ] Handle types for holding JS values in C++: `object`, `function`, persistent
          references.

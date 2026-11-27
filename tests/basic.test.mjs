@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { Worker } from "node:worker_threads";
 
 const require = createRequire(import.meta.url);
 const addonPath = fileURLToPath(
@@ -190,4 +191,92 @@ test("formats structured TypeScript type descriptors", () => {
     tsAddon.__anybind_dts__,
     /export function wrapCallback\(cb: \(\(arg0: bigint\) => number \| bigint\) \| undefined, n: number\): \(arg0: number \| bigint\) => bigint;/,
   );
+});
+
+test("maintains a per-environment type registry and resolves bound types", () => {
+  const reg = require(
+    fileURLToPath(
+      new URL("../build/tests/test_registry.node", import.meta.url),
+    ),
+  );
+  assert.equal(reg.failures(), "");
+  assert.equal(reg.hasGamma(), false);
+  assert.match(
+    reg.__anybind_dts__,
+    /export function echoAlpha\(a: Alpha\): Alpha;/,
+  );
+});
+
+test("isolates per-environment type registries across worker threads", async () => {
+  const registryPath = fileURLToPath(
+    new URL("../build/tests/test_registry.node", import.meta.url),
+  );
+  const mainReg = require(registryPath);
+
+  const workerScript = `
+    const assert = require("node:assert/strict");
+    const { parentPort, workerData } = require("node:worker_threads");
+    const reg = require(workerData.registryPath);
+    assert.equal(reg.failures(), "");
+    assert.equal(reg.hasGamma(), false);
+    assert.match(
+      reg.__anybind_dts__,
+      /export function echoAlpha\\(a: Alpha\\): Alpha;/,
+    );
+    reg.registerGamma();
+    assert.equal(reg.hasGamma(), true);
+    parentPort.postMessage({
+      addr: reg.registryAddr(),
+      salt: reg.alphaTagLower(),
+    });
+    // Stay alive until main verifies all workers concurrently, avoiding heap reuse.
+    parentPort.once("message", () => {});
+  `;
+
+  const spawnWorker = () => {
+    const worker = new Worker(workerScript, {
+      eval: true,
+      workerData: { registryPath },
+    });
+    const ready = new Promise((resolve, reject) => {
+      worker.once("message", resolve);
+      worker.once("error", reject);
+      worker.once("exit", (code) => {
+        reject(new Error(`worker exited early with code ${code}`));
+      });
+    });
+    const done = new Promise((resolve, reject) => {
+      worker.once("error", reject);
+      worker.once("exit", (code) => {
+        if (code !== 0) {
+          reject(new Error(`worker exited with code ${code}`));
+        } else {
+          resolve();
+        }
+      });
+    });
+    return { worker, ready, done };
+  };
+
+  const workers = Array.from({ length: 4 }, spawnWorker);
+  let results;
+  try {
+    results = await Promise.all(workers.map((w) => w.ready));
+  } finally {
+    for (const w of workers) w.worker.postMessage("release");
+  }
+  await Promise.all(workers.map((w) => w.done));
+
+  const addrs = new Set([
+    mainReg.registryAddr(),
+    ...results.map((r) => r.addr),
+  ]);
+  const salts = new Set([
+    mainReg.alphaTagLower(),
+    ...results.map((r) => r.salt),
+  ]);
+  assert.equal(addrs.size, 5);
+  assert.equal(salts.size, 5);
+  // Registering Gamma inside workers must not leak to the main environment.
+  assert.equal(mainReg.hasGamma(), false);
 });

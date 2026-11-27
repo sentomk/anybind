@@ -11,15 +11,18 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <atomic>
 #include <cmath>
 #include <exception>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <tuple>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 
 #define ANYBIND_VERSION_MAJOR 0
@@ -530,6 +533,124 @@ std::string ts_format(ts_dir dir = ts_dir::out, const ts_context& ctx = {}) {
   return out;
 }
 
+/* === Per-environment type registry === */
+
+struct type_info {
+  const void* id = nullptr;
+  std::string name;
+  napi_type_tag tag{0, 0};
+  napi_ref ctor_ref = nullptr;
+};
+
+/*
+ * Per-napi_env registry stored via `napi_set_instance_data`, so loading the
+ * same addon across worker threads or multiple contexts stays isolated and
+ * thread-safe, and every `napi_ref` is released when its environment exits.
+ */
+class type_registry {
+ public:
+  type_registry() : env_salt_(next_env_salt()) {}
+
+  type_registry(const type_registry&) = delete;
+  type_registry& operator=(const type_registry&) = delete;
+
+  static type_registry& get(napi_env env) {
+    void* raw = nullptr;
+    check(env, napi_get_instance_data(env, &raw));
+    if (raw != nullptr) return *static_cast<type_registry*>(raw);
+
+    auto* reg = new type_registry();
+    napi_status status = napi_set_instance_data(env, reg, &type_registry::finalize, nullptr);
+    if (status != napi_ok) {
+      delete reg;
+      check(env, status);
+    }
+    return *reg;
+  }
+
+  static type_registry* try_get(napi_env env) noexcept {
+    void* raw = nullptr;
+    if (napi_get_instance_data(env, &raw) != napi_ok) return nullptr;
+    return static_cast<type_registry*>(raw);
+  }
+
+  /* Takes ownership of `ctor_ref` (if non-null), including on error paths. */
+  type_info& register_type(napi_env env, const void* id, std::string name,
+                           napi_ref ctor_ref = nullptr) {
+    if (types_.find(id) != types_.end()) {
+      if (ctor_ref != nullptr) napi_delete_reference(env, ctor_ref);
+      throw std::runtime_error("anybind: type '" + name +
+                               "' is already registered in this environment");
+    }
+    try {
+      auto info = std::make_unique<type_info>();
+      info->id = id;
+      info->name = std::move(name);
+      info->tag = napi_type_tag{env_salt_, ++next_tag_id_};
+      auto [it, inserted] = types_.emplace(id, std::move(info));
+      (void)inserted;
+      // Transfer `ctor_ref` only after map insertion can no longer throw.
+      it->second->ctor_ref = ctor_ref;
+      return *it->second;
+    } catch (...) {
+      if (ctor_ref != nullptr) napi_delete_reference(env, ctor_ref);
+      throw;
+    }
+  }
+
+  template <typename T>
+  type_info& register_type(napi_env env, std::string name, napi_ref ctor_ref = nullptr) {
+    return register_type(env, type_id<intrinsic_t<T>>(), std::move(name), ctor_ref);
+  }
+
+  const type_info* find(const void* id) const noexcept {
+    auto it = types_.find(id);
+    return it == types_.end() ? nullptr : it->second.get();
+  }
+
+  template <typename T>
+  const type_info* find() const noexcept {
+    return find(type_id<intrinsic_t<T>>());
+  }
+
+  size_t size() const noexcept { return types_.size(); }
+
+ private:
+  static uint64_t next_env_salt() noexcept {
+    static std::atomic<uint64_t> counter{0};
+    return 0x616e7962696e6400ULL ^ (counter.fetch_add(1, std::memory_order_relaxed) + 1);
+  }
+
+  void cleanup(napi_env env) noexcept {
+    for (auto& [id, info] : types_) {
+      (void)id;
+      if (info && info->ctor_ref != nullptr) {
+        napi_delete_reference(env, info->ctor_ref);
+        info->ctor_ref = nullptr;
+      }
+    }
+    types_.clear();
+  }
+
+  static void finalize(napi_env env, void* data, void*) noexcept {
+    auto* reg = static_cast<type_registry*>(data);
+    reg->cleanup(env);
+    delete reg;
+  }
+
+  uint64_t env_salt_;
+  uint64_t next_tag_id_ = 0;
+  std::unordered_map<const void*, std::unique_ptr<type_info>> types_;
+};
+
+inline std::string resolve_bound_type(void* user_data, const void* id) {
+  auto* reg = static_cast<const type_registry*>(user_data);
+  if (reg != nullptr) {
+    if (const type_info* info = reg->find(id)) return info->name;
+  }
+  return "unknown";
+}
+
 /* === Callable introspection === */
 
 template <typename F>
@@ -847,7 +968,8 @@ using detail::ts_of;
 /** Handle to the module being initialized inside ANYBIND_MODULE. */
 class module_ {
  public:
-  module_(napi_env env, napi_value exports) : env_(env), exports_(exports) {}
+  module_(napi_env env, napi_value exports)
+      : env_(env), exports_(exports), registry_(&detail::type_registry::get(env)) {}
 
   /** Binds a free function, function pointer or (capturing) lambda. */
   template <typename Func, typename... Extra>
@@ -864,8 +986,9 @@ class module_ {
 
     auto slots = detail::make_arg_slots(typename traits::args{}, std::forward<Extra>(extra)...);
     size_t min_args = detail::compute_min_args(slots, indices{});
+    detail::ts_context ts_ctx{&detail::resolve_bound_type, registry_};
     std::string sig = detail::ts_signature<typename traits::return_type>(
-        name, typename traits::args{}, slots, min_args, indices{});
+        name, typename traits::args{}, slots, min_args, indices{}, ts_ctx);
 
     auto* record = new record_t{std::forward<Func>(f), std::move(slots), min_args};
     napi_value fn;
@@ -892,6 +1015,7 @@ class module_ {
  private:
   napi_env env_;
   napi_value exports_;
+  detail::type_registry* registry_;
   std::string dts_;
 };
 
