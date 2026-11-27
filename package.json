@@ -42,14 +42,16 @@
     "build:test": "cmake -S . -B build -DANYBIND_BUILD_TESTS=ON && cmake --build build",
     "test": "npm run build:test && node --test tests/basic.test.mjs tests/compile_fail.test.mjs",
     "lint": "biome check .",
-    "format": "biome check --write ."
+    "format": "biome check --write .",
+    "check:dts": "node tests/gen-dts.mjs && tsc -p tests/tsconfig.dts.json"
   },
   "publishConfig": {
     "registry": "https://registry.npmjs.org/",
     "access": "public"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.6.9"
+    "@biomejs/biome": "2.6.9",
+    "typescript": "^7.0.2"
   },
   "dependencies": {
     "node-api-headers": "^1.9.0"

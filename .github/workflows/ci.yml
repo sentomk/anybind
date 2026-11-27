@@ -5,13 +5,27 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  # Debug-style default build across every supported Node.js version.
   test:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         node: [18, 20, 22, 24]
+        include:
+          # ARM64 Linux and Windows (macos-latest is already ARM64).
+          - os: ubuntu-24.04-arm
+            node: 22
+          - os: windows-11-arm
+            node: 22
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -21,6 +35,65 @@ jobs:
       - run: npm ci
       - run: npm test
 
+  # Optimized builds: catches problems that only appear with Release settings,
+  # e.g. identical-data folding (MSVC /OPT:ICF) merging type IDs.
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: cmake -S . -B build -DANYBIND_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build --config Release
+      - run: node --test tests/basic.test.mjs
+
+  # Clang and the C++20 language mode (the baseline stays C++17).
+  cxx20:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: cmake -S . -B build -DANYBIND_BUILD_TESTS=ON -DCMAKE_CXX_STANDARD=20
+        env:
+          CXX: clang++
+      - run: cmake --build build
+      - run: node --test tests/basic.test.mjs tests/compile_fail.test.mjs
+
+  # AddressSanitizer and UndefinedBehaviorSanitizer. Node itself is not
+  # instrumented, so the sanitizer runtimes are preloaded.
+  sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: >-
+          cmake -S . -B build -DANYBIND_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Debug
+          "-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer"
+          "-DCMAKE_MODULE_LINKER_FLAGS=-fsanitize=address,undefined"
+        env:
+          CXX: g++
+      - run: cmake --build build
+      - name: Run suite under ASan and UBSan
+        run: |
+          export LD_PRELOAD="$(g++ -print-file-name=libasan.so):$(g++ -print-file-name=libubsan.so)"
+          node --test tests/basic.test.mjs
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+
+  # Other Node-API hosts.
   runtimes:
     strategy:
       fail-fast: false
@@ -44,10 +117,81 @@ jobs:
         run: deno run --allow-all tests/run.mjs
       - name: Install Electron
         run: npm install --no-save electron
-      - name: Run suite on Electron
+      - name: Run suite on Electron (as Node)
         env:
           ELECTRON_RUN_AS_NODE: "1"
         run: npx electron tests/run.mjs
+      - name: Run suite in the Electron main process
+        if: runner.os == 'Linux'
+        run: xvfb-run -a npx electron --no-sandbox tests/electron-main.cjs
+      - name: Run suite in the Electron main process
+        if: runner.os != 'Linux'
+        run: npx electron tests/electron-main.cjs
+
+  # The generated declarations must be valid TypeScript, on the newest
+  # compiler and on 5.6, the oldest one that accepts string export names.
+  dts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm run build:test
+      - run: npm run check:dts
+      - name: Type-check with TypeScript 5.6
+        run: npx -y -p typescript@5.6 tsc -p tests/tsconfig.dts.json
+
+  # The md4c example: fetches md4c, builds it in Release, runs the demo and
+  # type-checks its generated declarations.
+  example-md4c:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: cmake -S examples/md4c -B examples/md4c/build -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build examples/md4c/build --config Release
+      - run: node examples/md4c/demo.mjs
+      - run: node bin/anybind-stubgen.mjs examples/md4c/build/md4c.node examples/md4c/md4c.d.ts
+      - run: npx tsc --noEmit --strict examples/md4c/md4c.d.ts
+
+  # Installs the packed npm tarball into a fresh project and builds the README
+  # example with it, as a user would.
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm pack --pack-destination "$RUNNER_TEMP"
+      - name: Build the README example from the installed package
+        run: |
+          cp -r tests/consumer "$RUNNER_TEMP/consumer"
+          cd "$RUNNER_TEMP/consumer"
+          npm init -y > /dev/null
+          npm install ../anybind-*.tgz
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release
+          addon=build/example.node
+          [ -f "$addon" ] || addon=build/Release/example.node
+          npx anybind-stubgen "$addon" example.d.ts
+          node check.mjs
 
   lint:
     runs-on: ubuntu-latest

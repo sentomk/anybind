@@ -66,7 +66,8 @@ release criteria.
 
 ```sh
 npm ci
-npm test   # configures CMake, builds the test addons, runs node --test
+npm test            # configures CMake, builds the test addons, runs node --test
+npm run check:dts   # type-checks the generated .d.ts files with tsc
 ```
 
 Requires CMake ≥ 3.21, a C++17 compiler (MSVC or clang-cl on Windows), and Node.js ≥ 18.
