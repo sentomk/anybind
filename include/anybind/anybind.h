@@ -1218,6 +1218,121 @@ class function : public value {
   }
 };
 
+/**
+ * Persistent RAII handle (`napi_ref`) that keeps a JS handle (`value`,
+ * `object`, or `function`) valid across callback scopes.
+ *
+ * Move-only to keep ownership of the underlying `napi_ref` unambiguous; call
+ * `clone()` to create an independent reference. Under Node-API 8, persistent
+ * references support objects and functions (or a `value` holding one).
+ */
+template <typename T = value>
+class ref {
+  static_assert(std::is_base_of_v<value, T>,
+                "anybind::ref<T>: T must be anybind::value, object, or function");
+
+ public:
+  ref() noexcept = default;
+
+  explicit ref(const T& handle, uint32_t initial_refcount = 1) {
+    if (!handle) {
+      throw std::invalid_argument("anybind::ref: cannot reference an empty JS handle");
+    }
+    napi_env env = handle.env();
+    napi_ref raw_ref = nullptr;
+    detail::check(env, napi_create_reference(env, handle.raw(), initial_refcount, &raw_ref));
+    env_ = env;
+    ref_ = raw_ref;
+  }
+
+  /** Creates a strong persistent reference (`refcount = 1`) preventing GC. */
+  static ref strong(const T& handle) { return ref(handle, 1); }
+
+  /** Creates a weak reference (`refcount = 0`); `get()` returns `std::nullopt` once collected. */
+  static ref weak(const T& handle) { return ref(handle, 0); }
+
+  ref(const ref&) = delete;
+  ref& operator=(const ref&) = delete;
+
+  ref(ref&& other) noexcept : env_(other.env_), ref_(other.ref_) {
+    other.env_ = nullptr;
+    other.ref_ = nullptr;
+  }
+
+  ref& operator=(ref&& other) noexcept {
+    if (this != &other) {
+      reset();
+      env_ = other.env_;
+      ref_ = other.ref_;
+      other.env_ = nullptr;
+      other.ref_ = nullptr;
+    }
+    return *this;
+  }
+
+  ~ref() noexcept { reset(); }
+
+  explicit operator bool() const noexcept { return ref_ != nullptr; }
+  napi_env env() const noexcept { return env_; }
+  napi_ref raw() const noexcept { return ref_; }
+
+  /** Releases the underlying `napi_ref`, leaving this handle empty. */
+  void reset() noexcept {
+    if (ref_ != nullptr) {
+      napi_delete_reference(env_, ref_);
+      env_ = nullptr;
+      ref_ = nullptr;
+    }
+  }
+
+  /**
+   * Returns a scoped `T` handle if this reference is non-empty and still alive,
+   * or `std::nullopt` if empty or garbage-collected (for weak references).
+   */
+  std::optional<T> get() const {
+    if (ref_ == nullptr) return std::nullopt;
+    napi_value val = nullptr;
+    detail::check(env_, napi_get_reference_value(env_, ref_, &val));
+    if (val == nullptr) return std::nullopt;
+    return T(env_, val);
+  }
+
+  /** Increments the reference count and returns the new count. */
+  uint32_t ref_count_inc() {
+    require_ref();
+    uint32_t count = 0;
+    detail::check(env_, napi_reference_ref(env_, ref_, &count));
+    return count;
+  }
+
+  /** Decrements the reference count and returns the new count. */
+  uint32_t ref_count_dec() {
+    require_ref();
+    uint32_t count = 0;
+    detail::check(env_, napi_reference_unref(env_, ref_, &count));
+    return count;
+  }
+
+  /** Creates a new independent `ref<T>` pointing to the same JS value. */
+  ref clone(uint32_t initial_refcount = 1) const {
+    auto current = get();
+    if (!current) {
+      throw std::runtime_error("anybind::ref::clone: reference is empty or expired");
+    }
+    return ref(*current, initial_refcount);
+  }
+
+ private:
+  void require_ref() const {
+    if (env_ == nullptr || ref_ == nullptr) {
+      throw std::runtime_error("anybind::ref: attempted to use an empty reference");
+    }
+  }
+
+  napi_env env_ = nullptr;
+  napi_ref ref_ = nullptr;
+};
+
 namespace detail {
 
 template <>

@@ -391,3 +391,59 @@ test("supports value, object, and function JS handles", () => {
     /export function echoFunction\(fn: \(\.\.\.args: never\[\]\) => unknown\): \(\.\.\.args: unknown\[\]\) => unknown;/,
   );
 });
+
+test("supports persistent ref<T> handles across calls and worker teardown", async () => {
+  const handlesPath = fileURLToPath(
+    new URL("../build/tests/test_handles.node", import.meta.url),
+  );
+  const handles = require(handlesPath);
+
+  const obj = { count: 1 };
+  assert.equal(handles.checkRefLifecycle(obj), "");
+
+  // Store an object across separate JS calls and verify identity is preserved.
+  assert.equal(handles.loadObject(), undefined);
+  handles.storeObject(obj);
+  assert.equal(handles.loadObject(), obj);
+  handles.clearObject();
+  assert.equal(handles.loadObject(), undefined);
+
+  // Store a JS function across calls and invoke it later.
+  handles.storeCallback((n) => n * 3);
+  assert.equal(handles.invokeStored(14), 42);
+  handles.clearCallback();
+  assert.throws(() => handles.invokeStored(1), {
+    message: /no callback stored/,
+  });
+
+  // Under Node-API 8, refs work on objects/functions and reject primitives.
+  assert.equal(handles.refFromValue({ ok: true }), true);
+  assert.throws(() => handles.refFromValue(123));
+
+  // Verify persistent refs held at worker exit are cleaned up cleanly.
+  const workerScript = `
+    const assert = require("node:assert/strict");
+    const { workerData } = require("node:worker_threads");
+    const h = require(workerData.handlesPath);
+    const localObj = { tag: "worker" };
+    h.storeObject(localObj);
+    h.storeCallback((n) => n + 10);
+    assert.equal(h.loadObject(), localObj);
+    assert.equal(h.invokeStored(5), 15);
+    // Intentionally leave both strong refs populated through worker teardown.
+  `;
+  await new Promise((resolve, reject) => {
+    const worker = new Worker(workerScript, {
+      eval: true,
+      workerData: { handlesPath },
+    });
+    worker.once("error", reject);
+    worker.once("exit", (code) => {
+      if (code !== 0) {
+        reject(new Error(`worker exited with code ${code}`));
+      } else {
+        resolve();
+      }
+    });
+  });
+});

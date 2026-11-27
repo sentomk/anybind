@@ -62,7 +62,7 @@ with this?_ It ships only once every release criterion below is met.
        types, and `npm test` and `biome ci` pass.
    - [x] Per-environment type registry via instance data, so the addon works when loaded
          several times (worker threads, multiple contexts).
-   - [ ] Handle types for holding JS values in C++: `object`, `function`, persistent
+   - [x] Handle types for holding JS values in C++: `object`, `function`, persistent
          references.
    - [ ] `.d.ts` generation at build time, without loading the `.node` (needed for
          cross-compilation, e.g. HarmonyOS or Android arm64 built on an x86 host).
