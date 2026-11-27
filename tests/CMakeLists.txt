@@ -1,4 +1,4 @@
-foreach(addon test_basic test_defaults test_bad_default test_ts test_registry)
+foreach(addon test_basic test_defaults test_bad_default test_ts test_registry test_handles)
   anybind_add_module(${addon} ${addon}.cpp)
   # The generator expression keeps multi-config generators (Visual Studio)
   # from appending a per-configuration subdirectory.

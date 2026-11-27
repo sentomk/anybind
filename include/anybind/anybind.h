@@ -24,6 +24,7 @@
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #define ANYBIND_VERSION_MAJOR 0
 #define ANYBIND_VERSION_MINOR 0
@@ -117,6 +118,10 @@ struct field {
 
 template <typename... Fields>
 struct object {};
+
+/** Rest parameter inside `ts::function`, rendered as `...args: T[]`. */
+template <typename T>
+struct rest {};
 
 template <typename Sig>
 struct function;
@@ -488,6 +493,22 @@ struct ts_serializer<anybind::ts::object<Fields...>> {
   }
 };
 
+template <typename T>
+struct is_ts_rest : std::false_type {};
+
+template <typename T>
+struct is_ts_rest<anybind::ts::rest<T>> : std::true_type {};
+
+template <typename T>
+struct ts_rest_elem {
+  using type = T;
+};
+
+template <typename T>
+struct ts_rest_elem<anybind::ts::rest<T>> {
+  using type = T;
+};
+
 template <typename R, typename... Args>
 struct ts_serializer<anybind::ts::function<R(Args...)>> {
   template <ts_dir Dir>
@@ -498,10 +519,17 @@ struct ts_serializer<anybind::ts::function<R(Args...)>> {
       auto append_arg = [&](auto tag) {
         using ArgNode = typename decltype(tag)::type;
         if (i > 0) out += ", ";
-        out += "arg";
-        out += std::to_string(i++);
-        out += ": ";
-        ts_write_wrapped<ArgNode, flip_dir(Dir), 0>(out, ctx);
+        if constexpr (is_ts_rest<ArgNode>::value) {
+          out += "...args: ";
+          ts_write_wrapped<typename ts_rest_elem<ArgNode>::type, flip_dir(Dir), 2>(out, ctx);
+          out += "[]";
+          ++i;
+        } else {
+          out += "arg";
+          out += std::to_string(i++);
+          out += ": ";
+          ts_write_wrapped<ArgNode, flip_dir(Dir), 0>(out, ctx);
+        }
       };
       (append_arg(type_tag<Args>{}), ...);
     }
@@ -960,10 +988,283 @@ std::string ts_signature(const char* name, type_list<A...>,
   return s;
 }
 
+template <typename T>
+napi_value to_js_value(napi_env env, T&& v) {
+  using D = std::decay_t<T>;
+  if constexpr (std::is_same_v<D, const char*> || std::is_same_v<D, char*>) {
+    const char* s = v;
+    napi_value out = nullptr;
+    check(env, napi_create_string_utf8(env, s ? s : "", s ? NAPI_AUTO_LENGTH : 0, &out));
+    return out;
+  } else if constexpr (std::is_same_v<D, std::string_view>) {
+    napi_value out = nullptr;
+    check(env, napi_create_string_utf8(env, v.data(), v.size(), &out));
+    return out;
+  } else {
+    return type_caster<intrinsic_t<T>>::to_js(env, std::forward<T>(v));
+  }
+}
+
 }  // namespace detail
 
 /** TypeScript type descriptor for C++ type `T`. */
 using detail::ts_of;
+
+/* === Scoped JS handle types === */
+
+/**
+ * Non-owning handle to a JavaScript value valid within the current Node-API
+ * callback scope. Use `ref<T>` to keep a value alive across calls.
+ */
+class value {
+ public:
+  value() noexcept = default;
+  value(napi_env env, napi_value raw) noexcept : env_(env), raw_(raw) {}
+
+  explicit operator bool() const noexcept { return env_ != nullptr && raw_ != nullptr; }
+  napi_env env() const noexcept { return env_; }
+  napi_value raw() const noexcept { return raw_; }
+
+  napi_valuetype type() const {
+    require_handle();
+    napi_valuetype t;
+    detail::check(env_, napi_typeof(env_, raw_, &t));
+    return t;
+  }
+
+  bool is_undefined() const { return type() == napi_undefined; }
+  bool is_null() const { return type() == napi_null; }
+  bool is_null_or_undefined() const {
+    napi_valuetype t = type();
+    return t == napi_null || t == napi_undefined;
+  }
+  bool is_boolean() const { return type() == napi_boolean; }
+  bool is_number() const { return type() == napi_number; }
+  bool is_string() const { return type() == napi_string; }
+  bool is_symbol() const { return type() == napi_symbol; }
+  bool is_object() const { return type() == napi_object; }
+  bool is_function() const { return type() == napi_function; }
+  bool is_bigint() const { return type() == napi_bigint; }
+
+  bool is_array() const {
+    require_handle();
+    bool result = false;
+    detail::check(env_, napi_is_array(env_, raw_, &result));
+    return result;
+  }
+
+  bool strict_equals(const value& other) const {
+    require_handle();
+    other.require_handle();
+    if (env_ != other.env_) return false;
+    bool eq = false;
+    detail::check(env_, napi_strict_equals(env_, raw_, other.raw_, &eq));
+    return eq;
+  }
+
+  /** Converts this JS value to C++ type `T` using its `type_caster`. */
+  template <typename T>
+  T as() const {
+    require_handle();
+    return detail::type_caster<detail::intrinsic_t<T>>::from_js(env_, raw_);
+  }
+
+  /** Converts a C++ value to a scoped JS `value` in `env`. */
+  template <typename T>
+  static value from(napi_env env, T&& v) {
+    return value(env, detail::to_js_value(env, std::forward<T>(v)));
+  }
+
+  static value undefined(napi_env env) {
+    napi_value u = nullptr;
+    detail::check(env, napi_get_undefined(env, &u));
+    return value(env, u);
+  }
+
+  static value null(napi_env env) {
+    napi_value n = nullptr;
+    detail::check(env, napi_get_null(env, &n));
+    return value(env, n);
+  }
+
+ protected:
+  void require_handle() const {
+    if (env_ == nullptr || raw_ == nullptr) {
+      throw std::runtime_error("anybind: attempted to use an empty JS handle");
+    }
+  }
+
+  napi_env env_ = nullptr;
+  napi_value raw_ = nullptr;
+};
+
+/** Scoped handle to a JavaScript object, with property access helpers. */
+class object : public value {
+ public:
+  object() noexcept = default;
+  object(napi_env env, napi_value raw) noexcept : value(env, raw) {}
+
+  /** Creates a new empty plain JavaScript object `{}` in `env`. */
+  static object create(napi_env env) {
+    napi_value obj = nullptr;
+    detail::check(env, napi_create_object(env, &obj));
+    return object(env, obj);
+  }
+
+  bool has(std::string_view key) const {
+    require_handle();
+    bool result = false;
+    detail::check(env_, napi_has_property(env_, raw_, make_key(env_, key), &result));
+    return result;
+  }
+
+  bool has_own(std::string_view key) const {
+    require_handle();
+    bool result = false;
+    detail::check(env_, napi_has_own_property(env_, raw_, make_key(env_, key), &result));
+    return result;
+  }
+
+  value get(std::string_view key) const {
+    require_handle();
+    napi_value result = nullptr;
+    detail::check(env_, napi_get_property(env_, raw_, make_key(env_, key), &result));
+    return value(env_, result);
+  }
+
+  template <typename T>
+  T get(std::string_view key) const {
+    return get(key).as<T>();
+  }
+
+  template <typename T>
+  void set(std::string_view key, T&& val) const {
+    require_handle();
+    napi_value js_val = detail::to_js_value(env_, std::forward<T>(val));
+    detail::check(env_, napi_set_property(env_, raw_, make_key(env_, key), js_val));
+  }
+
+  bool del(std::string_view key) const {
+    require_handle();
+    bool deleted = false;
+    detail::check(env_, napi_delete_property(env_, raw_, make_key(env_, key), &deleted));
+    return deleted;
+  }
+
+  /** Returns own enumerable string keys, matching `Object.keys(obj)`. */
+  std::vector<std::string> keys() const {
+    require_handle();
+    napi_value arr = nullptr;
+    detail::check(env_,
+                  napi_get_all_property_names(
+                      env_, raw_, napi_key_own_only,
+                      static_cast<napi_key_filter>(napi_key_enumerable | napi_key_skip_symbols),
+                      napi_key_numbers_to_strings, &arr));
+    uint32_t len = 0;
+    detail::check(env_, napi_get_array_length(env_, arr, &len));
+    std::vector<std::string> out;
+    out.reserve(len);
+    for (uint32_t i = 0; i < len; ++i) {
+      napi_value elem = nullptr;
+      detail::check(env_, napi_get_element(env_, arr, i, &elem));
+      out.push_back(detail::type_caster<std::string>::from_js(env_, elem));
+    }
+    return out;
+  }
+
+ private:
+  static napi_value make_key(napi_env env, std::string_view key) {
+    napi_value js_key = nullptr;
+    detail::check(env, napi_create_string_utf8(env, key.data(), key.size(), &js_key));
+    return js_key;
+  }
+};
+
+/** Scoped handle to a JavaScript function callable from C++. */
+class function : public value {
+ public:
+  function() noexcept = default;
+  function(napi_env env, napi_value raw) noexcept : value(env, raw) {}
+
+  /** Invokes this JS function with `recv` as `this` and converted C++ arguments. */
+  template <typename... Args>
+  value call_with_this(const value& recv, Args&&... args) const {
+    require_handle();
+    if (!recv || recv.env() != env_) {
+      throw std::runtime_error("anybind: invalid receiver handle for function call");
+    }
+    napi_value result = nullptr;
+    if constexpr (sizeof...(Args) == 0) {
+      detail::check(env_, napi_call_function(env_, recv.raw(), raw_, 0, nullptr, &result));
+    } else {
+      // Braced initialization guarantees left-to-right argument conversion.
+      napi_value argv[sizeof...(Args)]{detail::to_js_value(env_, std::forward<Args>(args))...};
+      detail::check(env_,
+                    napi_call_function(env_, recv.raw(), raw_, sizeof...(Args), argv, &result));
+    }
+    return value(env_, result);
+  }
+
+  /** Invokes this JS function with `undefined` as `this`. */
+  template <typename... Args>
+  value call(Args&&... args) const {
+    require_handle();
+    return call_with_this(value::undefined(env_), std::forward<Args>(args)...);
+  }
+
+  template <typename... Args>
+  value operator()(Args&&... args) const {
+    return call(std::forward<Args>(args)...);
+  }
+};
+
+namespace detail {
+
+template <>
+struct type_caster<anybind::value> {
+  using ts = anybind::ts::unknown;
+  static anybind::value from_js(napi_env env, napi_value v) { return anybind::value(env, v); }
+  static napi_value to_js(napi_env env, const anybind::value& v) {
+    if (!v || v.env() != env) {
+      throw std::runtime_error("anybind: cannot return an empty or foreign-environment JS handle");
+    }
+    return v.raw();
+  }
+};
+
+template <>
+struct type_caster<anybind::object> {
+  using ts = anybind::ts::record<anybind::ts::string, anybind::ts::unknown>;
+  static anybind::object from_js(napi_env env, napi_value v) {
+    expect_type(env, v, napi_object, "object");
+    return anybind::object(env, v);
+  }
+  static napi_value to_js(napi_env env, const anybind::object& v) {
+    if (!v || v.env() != env) {
+      throw std::runtime_error("anybind: cannot return an empty or foreign-environment JS handle");
+    }
+    return v.raw();
+  }
+};
+
+template <>
+struct type_caster<anybind::function> {
+  using ts =
+      anybind::ts::io<anybind::ts::function<anybind::ts::unknown(anybind::ts::rest<anybind::ts::never>)>,
+                      anybind::ts::function<anybind::ts::unknown(anybind::ts::rest<anybind::ts::unknown>)>>;
+  static anybind::function from_js(napi_env env, napi_value v) {
+    expect_type(env, v, napi_function, "function");
+    return anybind::function(env, v);
+  }
+  static napi_value to_js(napi_env env, const anybind::function& v) {
+    if (!v || v.env() != env) {
+      throw std::runtime_error("anybind: cannot return an empty or foreign-environment JS handle");
+    }
+    return v.raw();
+  }
+};
+
+}  // namespace detail
 
 /** Handle to the module being initialized inside ANYBIND_MODULE. */
 class module_ {

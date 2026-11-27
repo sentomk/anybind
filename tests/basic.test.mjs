@@ -280,3 +280,114 @@ test("isolates per-environment type registries across worker threads", async () 
   // Registering Gamma inside workers must not leak to the main environment.
   assert.equal(mainReg.hasGamma(), false);
 });
+
+test("supports value, object, and function JS handles", () => {
+  const handles = require(
+    fileURLToPath(new URL("../build/tests/test_handles.node", import.meta.url)),
+  );
+
+  // value predicates, strict equality and conversions.
+  assert.equal(handles.describeValue(undefined), "undefined");
+  assert.equal(handles.describeValue(null), "null");
+  assert.equal(handles.describeValue(true), "bool:true");
+  assert.equal(handles.describeValue(42), "number:42");
+  assert.equal(handles.describeValue("abc"), "string:abc");
+  assert.equal(handles.describeValue(10n), "bigint");
+  assert.equal(handles.describeValue(Symbol("s")), "symbol");
+  assert.equal(
+    handles.describeValue(() => {}),
+    "function",
+  );
+  assert.equal(handles.describeValue([1, 2]), "array");
+  assert.equal(handles.describeValue({}), "object");
+
+  const refObj = { id: 1 };
+  assert.equal(handles.echoValue(refObj), refObj);
+  assert.equal(handles.sameValue(refObj, refObj), true);
+  assert.equal(handles.sameValue(refObj, { id: 1 }), false);
+  assert.equal(handles.makeNull(), null);
+  assert.equal(handles.makeGreetingValue(), "hi");
+  assert.throws(() => handles.returnEmptyValue(), {
+    message: /empty or foreign-environment JS handle/,
+  });
+
+  // object creation, property access, prototype vs own keys, and type checks.
+  assert.deepEqual(handles.makePoint(3, 4), {
+    x: 3,
+    y: 4,
+    kind: "point",
+    tag: "2d",
+  });
+  const proto = { inherited: true };
+  const target = Object.create(proto);
+  target.a = 7;
+  target.b = 9;
+  target.c = "ok";
+  Object.defineProperty(target, "hidden", { value: 1, enumerable: false });
+  target[Symbol("sym")] = 2;
+  const info = handles.inspectObject(target);
+  assert.deepEqual(info, {
+    hasProto: true,
+    hasOwnProto: false,
+    hasOwnA: true,
+    a: 7,
+    deletedB: true,
+    keys: "a,c",
+  });
+  assert.equal("b" in target, false);
+  assert.throws(() => handles.inspectObject(null), {
+    name: "TypeError",
+    message: /argument 1 \(obj\): expected object/,
+  });
+  assert.throws(() => handles.inspectObject(123), TypeError);
+  assert.throws(() => handles.inspectObject(() => {}), TypeError);
+
+  // function invocation, `this` binding, exception propagation, and type checks.
+  assert.equal(
+    handles.callZero(() => "pong"),
+    "pong",
+  );
+  assert.equal(
+    handles.callAdd((a, b) => a + b, 19, 23),
+    42,
+  );
+  assert.equal(
+    handles.callMethod(
+      { prefix: "hi" },
+      function (suffix) {
+        return `${this.prefix}:${suffix}`;
+      },
+      "there",
+    ),
+    "hi:there",
+  );
+  class CustomError extends Error {}
+  const custom = new CustomError("boom from js");
+  assert.throws(
+    () =>
+      handles.callZero(() => {
+        throw custom;
+      }),
+    (err) => err === custom,
+  );
+  const fn = (x) => x * 2;
+  assert.equal(handles.echoFunction(fn), fn);
+  assert.throws(() => handles.callZero(42), {
+    name: "TypeError",
+    message: /argument 1 \(fn\): expected function/,
+  });
+
+  // TypeScript declarations for handles never use `any`.
+  assert.match(
+    handles.__anybind_dts__,
+    /export function echoValue\(v: unknown\): unknown;/,
+  );
+  assert.match(
+    handles.__anybind_dts__,
+    /export function makePoint\(x: number, y: number\): Record<string, unknown>;/,
+  );
+  assert.match(
+    handles.__anybind_dts__,
+    /export function echoFunction\(fn: \(\.\.\.args: never\[\]\) => unknown\): \(\.\.\.args: unknown\[\]\) => unknown;/,
+  );
+});
