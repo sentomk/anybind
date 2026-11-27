@@ -11,6 +11,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <exception>
@@ -269,6 +270,178 @@ struct type_caster<std::string> {
     napi_value result;
     check(env, napi_create_string_utf8(env, value.data(), value.size(), &result));
     return result;
+  }
+};
+
+/*
+ * Maps a parameter's intrinsic C++ type to the owning type stored in `arg_slot`
+ * and `call`'s argument tuple. Non-owning views such as `std::string_view`
+ * store an owning `std::string` for the duration of the call.
+ */
+template <typename T, typename = void>
+struct caster_storage {
+  using type = T;
+  static T store(T v) { return v; }
+  static T& unwrap(T& v) noexcept { return v; }
+};
+
+template <>
+struct caster_storage<std::string_view> {
+  using type = std::string;
+  static std::string store(std::string_view v) { return std::string(v); }
+  static std::string_view unwrap(const std::string& v) noexcept { return v; }
+};
+
+template <typename T>
+struct caster_storage<std::optional<T>,
+                      std::enable_if_t<!std::is_same_v<
+                          typename caster_storage<intrinsic_t<T>>::type, intrinsic_t<T>>>> {
+  using inner = caster_storage<intrinsic_t<T>>;
+  using type = std::optional<typename inner::type>;
+  static type store(std::optional<T> v) {
+    if (!v.has_value()) return std::nullopt;
+    return type(inner::store(*v));
+  }
+  static std::optional<T> unwrap(type& v) {
+    if (!v.has_value()) return std::nullopt;
+    return std::optional<T>(inner::unwrap(*v));
+  }
+};
+
+template <typename T>
+using storage_t = typename caster_storage<intrinsic_t<T>>::type;
+
+template <>
+struct type_caster<std::string_view> {
+  using ts = anybind::ts::string;
+  static std::string from_js(napi_env env, napi_value value) {
+    return type_caster<std::string>::from_js(env, value);
+  }
+  static napi_value to_js(napi_env env, std::string_view value) {
+    napi_value result = nullptr;
+    const char* ptr = value.empty() ? "" : value.data();
+    check(env, napi_create_string_utf8(env, ptr, value.size(), &result));
+    return result;
+  }
+};
+
+template <typename T>
+struct type_caster<std::optional<T>> {
+  using ts = anybind::ts::union_<ts_of<T>, anybind::ts::undefined>;
+  using result_t = storage_t<std::optional<T>>;
+  static result_t from_js(napi_env env, napi_value value) {
+    napi_valuetype actual;
+    check(env, napi_typeof(env, value, &actual));
+    if (actual == napi_undefined) return std::nullopt;
+    return result_t(type_caster<intrinsic_t<T>>::from_js(env, value));
+  }
+  static napi_value to_js(napi_env env, const std::optional<T>& value) {
+    if (!value.has_value()) {
+      napi_value u = nullptr;
+      check(env, napi_get_undefined(env, &u));
+      return u;
+    }
+    return type_caster<intrinsic_t<T>>::to_js(env, *value);
+  }
+};
+
+template <typename T>
+struct type_caster<std::vector<T>> {
+  using elem_t = intrinsic_t<T>;
+  using ts = anybind::ts::array<ts_of<elem_t>>;
+  static std::vector<T> from_js(napi_env env, napi_value value) {
+    bool is_arr = false;
+    check(env, napi_is_array(env, value, &is_arr));
+    if (!is_arr) throw type_error("expected array");
+    uint32_t len = 0;
+    check(env, napi_get_array_length(env, value, &len));
+    std::vector<T> result;
+    result.reserve(len);
+    for (uint32_t i = 0; i < len; ++i) {
+      napi_value elem = nullptr;
+      check(env, napi_get_element(env, value, i, &elem));
+      try {
+        result.push_back(type_caster<elem_t>::from_js(env, elem));
+      } catch (const type_error& e) {
+        throw type_error("element " + std::to_string(i) + ": " + e.what());
+      }
+    }
+    return result;
+  }
+  static napi_value to_js(napi_env env, const std::vector<T>& value) {
+    if (value.size() > std::numeric_limits<uint32_t>::max()) {
+      throw std::length_error("anybind: vector exceeds JavaScript array length limit");
+    }
+    napi_value arr = nullptr;
+    check(env, napi_create_array_with_length(env, value.size(), &arr));
+    uint32_t i = 0;
+    // Use forwarding reference so `std::vector<bool>` proxies do not warn.
+    for (auto&& elem : value) {
+      napi_value js_elem = type_caster<elem_t>::to_js(env, elem);
+      check(env, napi_set_element(env, arr, i++, js_elem));
+    }
+    return arr;
+  }
+};
+
+template <typename Node, typename Seq>
+struct ts_repeat_tuple;
+
+template <typename Node, size_t... I>
+struct ts_repeat_tuple<Node, std::index_sequence<I...>> {
+  template <size_t>
+  using always = Node;
+  using type = anybind::ts::tuple<always<I>...>;
+};
+
+template <typename Node, size_t N, bool AsTuple = (N <= 16)>
+struct ts_fixed_array {
+  using type = anybind::ts::array<Node>;
+};
+
+template <typename Node, size_t N>
+struct ts_fixed_array<Node, N, true> {
+  using type = typename ts_repeat_tuple<Node, std::make_index_sequence<N>>::type;
+};
+
+template <typename T, size_t N>
+struct type_caster<std::array<T, N>> {
+  using elem_t = intrinsic_t<T>;
+  using ts = typename ts_fixed_array<ts_of<elem_t>, N>::type;
+  static std::array<T, N> from_js(napi_env env, napi_value value) {
+    bool is_arr = false;
+    check(env, napi_is_array(env, value, &is_arr));
+    if (!is_arr) throw type_error("expected array");
+    uint32_t len = 0;
+    check(env, napi_get_array_length(env, value, &len));
+    if (len != N) {
+      throw type_error("expected array of length " + std::to_string(N) + ", got " +
+                       std::to_string(len));
+    }
+    std::array<T, N> result{};
+    if constexpr (N > 0) {
+      for (size_t i = 0; i < N; ++i) {
+        napi_value elem = nullptr;
+        check(env, napi_get_element(env, value, static_cast<uint32_t>(i), &elem));
+        try {
+          result[i] = type_caster<elem_t>::from_js(env, elem);
+        } catch (const type_error& e) {
+          throw type_error("element " + std::to_string(i) + ": " + e.what());
+        }
+      }
+    }
+    return result;
+  }
+  static napi_value to_js(napi_env env, const std::array<T, N>& value) {
+    napi_value arr = nullptr;
+    check(env, napi_create_array_with_length(env, N, &arr));
+    if constexpr (N > 0) {
+      for (size_t i = 0; i < N; ++i) {
+        napi_value js_elem = type_caster<elem_t>::to_js(env, value[i]);
+        check(env, napi_set_element(env, arr, static_cast<uint32_t>(i), js_elem));
+      }
+    }
+    return arr;
   }
 };
 
@@ -783,40 +956,46 @@ void check_default_value([[maybe_unused]] const char* name, [[maybe_unused]] con
   }
 }
 
-template <typename T>
-arg_slot<T> make_arg_slot(const arg& a) {
-  return arg_slot<T>{a.name ? a.name : "", std::nullopt};
+template <typename A>
+arg_slot<storage_t<A>> make_arg_slot(const arg& a) {
+  return arg_slot<storage_t<A>>{a.name ? a.name : "", std::nullopt};
 }
 
-template <typename T, typename V>
-arg_slot<T> make_arg_slot(arg_v<V>&& a) {
+template <typename A, typename V>
+arg_slot<storage_t<A>> make_arg_slot(arg_v<V>&& a) {
+  using T = intrinsic_t<A>;
+  using S = storage_t<A>;
   static_assert(std::is_convertible_v<V&&, T>,
                 "anybind::arg: default value is not convertible to the parameter type");
   check_default_value<T>(a.name, a.value);
   // Explicit: arithmetic narrowing was range-checked above.
-  return arg_slot<T>{a.name ? a.name : "", std::optional<T>(static_cast<T>(std::move(a.value)))};
+  return arg_slot<S>{a.name ? a.name : "",
+                     std::optional<S>(caster_storage<T>::store(static_cast<T>(std::move(a.value))))};
 }
 
-template <typename T, typename V>
-arg_slot<T> make_arg_slot(const arg_v<V>& a) {
+template <typename A, typename V>
+arg_slot<storage_t<A>> make_arg_slot(const arg_v<V>& a) {
+  using T = intrinsic_t<A>;
+  using S = storage_t<A>;
   static_assert(std::is_convertible_v<const V&, T>,
                 "anybind::arg: default value is not convertible to the parameter type");
   check_default_value<T>(a.name, a.value);
-  return arg_slot<T>{a.name ? a.name : "", std::optional<T>(static_cast<T>(a.value))};
+  return arg_slot<S>{a.name ? a.name : "",
+                     std::optional<S>(caster_storage<T>::store(static_cast<T>(a.value)))};
 }
 
 /* Overload 1: no arg() specs passed (backward compatible). */
 template <typename... A>
-std::tuple<arg_slot<intrinsic_t<A>>...> make_arg_slots(type_list<A...>) {
+std::tuple<arg_slot<storage_t<A>>...> make_arg_slots(type_list<A...>) {
   return {};
 }
 
 /* Overload 2: one arg() spec per parameter. */
 template <typename FirstA, typename... RestA, typename FirstExtra, typename... RestExtra>
-std::tuple<arg_slot<intrinsic_t<FirstA>>, arg_slot<intrinsic_t<RestA>>...> make_arg_slots(
+std::tuple<arg_slot<storage_t<FirstA>>, arg_slot<storage_t<RestA>>...> make_arg_slots(
     type_list<FirstA, RestA...>, FirstExtra&& first, RestExtra&&... rest) {
-  return {make_arg_slot<intrinsic_t<FirstA>>(std::forward<FirstExtra>(first)),
-          make_arg_slot<intrinsic_t<RestA>>(std::forward<RestExtra>(rest))...};
+  return {make_arg_slot<FirstA>(std::forward<FirstExtra>(first)),
+          make_arg_slot<RestA>(std::forward<RestExtra>(rest))...};
 }
 
 template <typename List>
@@ -824,7 +1003,7 @@ struct slots_for_list;
 
 template <typename... A>
 struct slots_for_list<type_list<A...>> {
-  using type = std::tuple<arg_slot<intrinsic_t<A>>...>;
+  using type = std::tuple<arg_slot<storage_t<A>>...>;
 };
 
 template <typename SlotsTuple, size_t... I>
@@ -857,7 +1036,8 @@ napi_value guard(napi_env env, Fn&& fn) noexcept {
 }
 
 template <typename T>
-T load_arg(napi_env env, napi_value* argv, size_t argc, size_t index, const arg_slot<T>& slot) {
+storage_t<T> load_arg(napi_env env, napi_value* argv, size_t argc, size_t index,
+                      const arg_slot<storage_t<T>>& slot) {
   if (slot.default_value.has_value()) {
     // Missing trailing argument or explicit `undefined` falls back to default.
     if (index >= argc) return *slot.default_value;
@@ -879,15 +1059,16 @@ napi_value call(napi_env env, F& f, [[maybe_unused]] napi_value* argv, [[maybe_u
                 [[maybe_unused]] const SlotsTuple& slots, type_list<A...>,
                 std::index_sequence<I...>) {
   // Braced initialization guarantees left-to-right argument conversion.
-  [[maybe_unused]] std::tuple<intrinsic_t<A>...> values{
+  [[maybe_unused]] std::tuple<storage_t<A>...> values{
       load_arg<intrinsic_t<A>>(env, argv, argc, I, std::get<I>(slots))...};
   if constexpr (std::is_void_v<R>) {
-    f(std::get<I>(values)...);
+    f(caster_storage<intrinsic_t<A>>::unwrap(std::get<I>(values))...);
     napi_value undefined;
     check(env, napi_get_undefined(env, &undefined));
     return undefined;
   } else {
-    return type_caster<intrinsic_t<R>>::to_js(env, f(std::get<I>(values)...));
+    return type_caster<intrinsic_t<R>>::to_js(
+        env, f(caster_storage<intrinsic_t<A>>::unwrap(std::get<I>(values))...));
   }
 }
 
@@ -956,6 +1137,13 @@ inline std::string ts_param_name(std::string_view name, size_t index) {
   return out;
 }
 
+template <typename Node, typename Target>
+struct ts_contains : std::is_same<Node, Target> {};
+
+template <typename Target, typename... Ts>
+struct ts_contains<anybind::ts::union_<Ts...>, Target>
+    : std::disjunction<ts_contains<Ts, Target>...> {};
+
 template <typename R, typename... A, typename SlotsTuple, size_t... I>
 std::string ts_signature(const char* name, type_list<A...>,
                          [[maybe_unused]] const SlotsTuple& slots, [[maybe_unused]] size_t min_args,
@@ -974,8 +1162,12 @@ std::string ts_signature(const char* name, type_list<A...>,
     } else if (slot.default_value.has_value()) {
       // Non-trailing default: TS forbids `?` before a required parameter.
       s += ": ";
-      ts_write_wrapped<anybind::ts::union_<ts_of<ParamT>, anybind::ts::undefined>, ts_dir::in, 0>(
-          s, ctx);
+      if constexpr (ts_contains<ts_of<ParamT>, anybind::ts::undefined>::value) {
+        ts_write_wrapped<ts_of<ParamT>, ts_dir::in, 0>(s, ctx);
+      } else {
+        ts_write_wrapped<anybind::ts::union_<ts_of<ParamT>, anybind::ts::undefined>, ts_dir::in, 0>(
+            s, ctx);
+      }
     } else {
       s += ": ";
       ts_write_wrapped<ts_of<ParamT>, ts_dir::in, 0>(s, ctx);
@@ -1364,9 +1556,9 @@ struct type_caster<anybind::object> {
 
 template <>
 struct type_caster<anybind::function> {
-  using ts =
-      anybind::ts::io<anybind::ts::function<anybind::ts::unknown(anybind::ts::rest<anybind::ts::never>)>,
-                      anybind::ts::function<anybind::ts::unknown(anybind::ts::rest<anybind::ts::unknown>)>>;
+  using ts = anybind::ts::io<
+      anybind::ts::function<anybind::ts::unknown(anybind::ts::rest<anybind::ts::never>)>,
+      anybind::ts::function<anybind::ts::unknown(anybind::ts::rest<anybind::ts::unknown>)>>;
   static anybind::function from_js(napi_env env, napi_value v) {
     expect_type(env, v, napi_function, "function");
     return anybind::function(env, v);

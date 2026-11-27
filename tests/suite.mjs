@@ -454,4 +454,95 @@ export function registerTests(test) {
       });
     });
   });
+
+  test("converts std::string_view, std::optional, std::vector, and std::array", () => {
+    const stl = require(
+      fileURLToPath(new URL("../build/tests/test_stl.node", import.meta.url)),
+    );
+
+    // std::string_view
+    assert.equal(stl.svLen(), 5);
+    assert.equal(stl.svLen("anybind"), 7);
+    assert.equal(stl.svTrimPrefix("pre_hello"), "hello");
+    assert.equal(stl.svTrimPrefix("hello", "no_"), "hello");
+    assert.equal(stl.svEmpty(), "");
+
+    // std::optional
+    assert.equal(stl.optDouble(), undefined);
+    assert.equal(stl.optDouble(undefined), undefined);
+    assert.equal(stl.optDouble(21), 42);
+    assert.throws(() => stl.optDouble(null), {
+      name: "TypeError",
+      message: /argument 1 \(v\): expected number/,
+    });
+    assert.equal(stl.optGreeting(undefined, 2), "guest,guest");
+    assert.equal(stl.optGreeting("ada", 2), "ada,ada");
+
+    // std::vector
+    assert.equal(stl.sumInts([1, 2, 3, 4]), 10);
+    assert.equal(stl.sumInts([]), 0);
+    assert.throws(() => stl.sumInts("not-array"), {
+      name: "TypeError",
+      message: /argument 1 \(nums\): expected array/,
+    });
+    assert.throws(() => stl.sumInts([1, "bad", 3]), {
+      name: "TypeError",
+      message: /argument 1 \(nums\): element 1: expected number/,
+    });
+    assert.deepEqual(stl.invertFlags([true, false, true]), [
+      false,
+      true,
+      false,
+    ]);
+    assert.deepEqual(stl.flatten([[1, 2], [], [3]]), [1, 2, 3]);
+    assert.deepEqual(stl.compact([1, undefined, 2, undefined, 3]), [1, 2, 3]);
+
+    // std::array
+    assert.deepEqual(stl.scaleVec3([1, 2, 3], 2), [2, 4, 6]);
+    assert.deepEqual(stl.emptyArr([]), []);
+    const twenty = Array.from({ length: 20 }, (_, i) => i);
+    assert.deepEqual(stl.bigArr(twenty), twenty);
+    assert.throws(() => stl.scaleVec3([1, 2]), {
+      name: "TypeError",
+      message: /argument 1 \(v\): expected array of length 3, got 2/,
+    });
+    assert.throws(() => stl.scaleVec3([1, "x", 3]), {
+      name: "TypeError",
+      message: /argument 1 \(v\): element 1: expected number/,
+    });
+
+    // Generated .d.ts signatures
+    assert.match(
+      stl.__anybind_dts__,
+      /export function svLen\(s\?: string\): number;/,
+    );
+    assert.match(
+      stl.__anybind_dts__,
+      /export function optDouble\(v\?: number \| undefined\): number \| undefined;/,
+    );
+    assert.match(
+      stl.__anybind_dts__,
+      /export function optGreeting\(name: string \| undefined, repeat: number\): string;/,
+    );
+    assert.match(
+      stl.__anybind_dts__,
+      /export function flatten\(grid: number\[\]\[\]\): number\[\];/,
+    );
+    assert.match(
+      stl.__anybind_dts__,
+      /export function compact\(items: \(number \| undefined\)\[\]\): number\[\];/,
+    );
+    assert.match(
+      stl.__anybind_dts__,
+      /export function scaleVec3\(v: \[number, number, number\], k\?: number\): \[number, number, number\];/,
+    );
+    assert.match(
+      stl.__anybind_dts__,
+      /export function emptyArr\(a: \[\]\): \[\];/,
+    );
+    assert.match(
+      stl.__anybind_dts__,
+      /export function bigArr\(a: number\[\]\): number\[\];/,
+    );
+  });
 }
