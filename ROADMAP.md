@@ -36,8 +36,30 @@ with this?_ It ships only once every release criterion below is met.
 ### Scope, in dependency order
 
 1. **Foundations**
-   - [ ] Composable TypeScript type names (to support `Array<T>`, `T | undefined`, nested
-         types); today each caster has a fixed `ts_name`.
+   - [ ] Structured TypeScript type descriptors, replacing the fixed `ts_name` string.
+     - Each `type_caster` declares `using ts = ...`: a tree of template types such as
+       `ts::string`, `ts::array<ts_of<T>>`, `ts::union_<...>`.
+     - First node set, limited to what 0.1 needs: primitives, literals, `array`, `tuple`,
+       `union_`, `undefined`, object/record, `function`, `bound<T>` (placeholder for a
+       bound class) and `io<In, Out>` (different parameter and return types, e.g.
+       `int64_t` is `number | bigint` as a parameter and `bigint` as a return value).
+     - Optional parameters stay a function-signature concern; the existing `arg` default
+       value logic is kept.
+     - Serializers are separate from the tree: a compile-time encoder writes constant bytes
+       into a dedicated binary section (for build-time `.d.ts` extraction, using internal
+       fixed-length char array concatenation); a runtime serializer produces the TS text
+       for `__anybind_dts__`. Other outputs (ArkTS, JSON Schema) can be added later.
+     - To decide before implementing: how class names are known at build time, since
+       `class_<T>("Foo")` passes the name at run time. Either class registration also
+       writes a compile-time "type ID → class name" entry into the section (requires an
+       API change), or build-time extraction does not cover signatures involving classes
+       for now.
+     - Risks: deeply nested types may slow compilation or hit template depth limits, so
+       prototype and measure first. The `ts::` nodes become public API (users need them
+       for custom casters in 0.3), so they are part of the 0.1 API review.
+     - Done when: all existing types are migrated, the generated `.d.ts` is identical to
+       today's, there are tests for nested types and for differing parameter/return
+       types, and `npm test` and `biome ci` pass.
    - [ ] Per-environment type registry via instance data, so the addon works when loaded
          several times (worker threads, multiple contexts).
    - [ ] Handle types for holding JS values in C++: `object`, `function`, persistent
@@ -77,7 +99,7 @@ with this?_ It ships only once every release criterion below is met.
 - [ ] Documentation: getting started, conversion rules for every type, ownership guide,
       migration guide from `node-addon-api`
 - [ ] Public API review: the API shape should be stable at release, since breaking changes
-      get expensive once users adopt it
+      get expensive once users adopt it (including the `ts::` descriptor nodes)
 - [ ] Scope locked: anything not listed above goes to 0.2
 
 **Launch demo:** one `.node` file loaded in Node, Bun, Deno and Electron, the generated
