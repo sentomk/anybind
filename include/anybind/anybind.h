@@ -1464,6 +1464,15 @@ decltype(auto) forward_arg(S& stored) {
   }
 }
 
+/*
+ * When the bound function always throws and is inlined (Release builds), the
+ * code after the call is unreachable. MSVC reports that as C4702, which `/WX`
+ * would turn into an error in user code, so it is silenced for `call` only.
+ */
+#if defined(_MSC_VER) && !defined(__clang__)
+#pragma warning(push)
+#pragma warning(disable : 4702)
+#endif
 template <typename R, typename F, typename SlotsTuple, typename... A, size_t... I>
 napi_value call(napi_env env, F& f, [[maybe_unused]] napi_value* argv, [[maybe_unused]] size_t argc,
                 [[maybe_unused]] const SlotsTuple& slots, type_list<A...>,
@@ -1480,6 +1489,9 @@ napi_value call(napi_env env, F& f, [[maybe_unused]] napi_value* argv, [[maybe_u
     return type_caster<intrinsic_t<R>>::to_js(env, f(forward_arg<A>(std::get<I>(values))...));
   }
 }
+#if defined(_MSC_VER) && !defined(__clang__)
+#pragma warning(pop)
+#endif
 
 template <typename Func>
 struct function_record {
