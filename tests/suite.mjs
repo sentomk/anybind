@@ -630,6 +630,16 @@ export function registerTests(test) {
       message: /argument 1 \(v\): expected number\[\] \| string\[\]/,
     });
 
+    // A "__proto__" key round-trips as an own property and leaves the prototype intact.
+    const groups = stl.echoGroups(JSON.parse('{"__proto__": [1], "a": [2]}'));
+    assert.equal(Object.getPrototypeOf(groups), Object.prototype);
+    assert.deepEqual(Object.keys(groups).sort(), ["__proto__", "a"]);
+    assert.deepEqual(
+      Object.getOwnPropertyDescriptor(groups, "__proto__").value,
+      [1],
+    );
+    assert.deepEqual(groups.a, [2]);
+
     // Generated .d.ts signatures (including union deduplication)
     assert.match(
       stl.__anybind_dts__,
@@ -875,6 +885,17 @@ export function registerTests(test) {
       valueOf: 8,
     });
 
+    // A field keyed "__proto__" is read from and written to an own property.
+    const pk = st.echoProtoKey(JSON.parse('{"__proto__": 5}'));
+    assert.equal(Object.getPrototypeOf(pk), Object.prototype);
+    assert.deepEqual(Object.keys(pk), ["__proto__"]);
+    assert.equal(Object.getOwnPropertyDescriptor(pk, "__proto__").value, 5);
+    assert.throws(() => st.echoProtoKey({}), {
+      name: "TypeError",
+      message:
+        /argument 1 \(v\): property '__proto__': missing required property/,
+    });
+
     // Other inherited properties, such as getters on a class prototype, are read.
     class PointLike {
       get x() {
@@ -885,6 +906,10 @@ export function registerTests(test) {
       }
     }
     assert.deepEqual(st.translate(new PointLike(), 1, 1), { x: 6, y: 7 });
+    // Overriding an Object.prototype name on an intermediate prototype counts as provided.
+    assert.deepEqual(st.echoProtoRequired(Object.create({ constructor: 9 })), {
+      constructor: 9,
+    });
 
     // Nested structs, vectors, bigint, variant, anonymous namespace, custom keys.
     assert.deepEqual(

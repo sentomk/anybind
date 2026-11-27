@@ -62,6 +62,11 @@ struct CustomKeys {
   int count = 0;
 };
 
+/* Serialized under the key "__proto__", which C++ cannot spell as a member name. */
+struct ProtoKey {
+  int value = 0;
+};
+
 /* Counts copies so tests can check that converted arguments are moved, not copied. */
 static int g_tracked_copies = 0;
 
@@ -105,6 +110,18 @@ struct struct_traits<CustomKeys> {
 };
 }  // namespace anybind
 
+namespace anybind {
+template <>
+struct struct_traits<ProtoKey> {
+  static constexpr bool is_specialized = true;
+  static constexpr bool has_defaults = false;
+  static constexpr char kProto[] = "__proto__";
+  static constexpr auto fields() noexcept {
+    return std::make_tuple(make_field<kProto>(&ProtoKey::value));
+  }
+};
+}  // namespace anybind
+
 ANYBIND_MODULE(test_struct, m) {
   using namespace anybind::literals;
 
@@ -131,6 +148,9 @@ ANYBIND_MODULE(test_struct, m) {
       "echoProtoOptional", [](const ProtoOptional& v) { return v; }, "v"_a);
   m.def(
       "echoProtoDefaults", [](const ProtoDefaults& v) { return v; }, "v"_a);
+
+  m.def(
+      "echoProtoKey", [](const ProtoKey& v) { return v; }, "v"_a);
 
   // Every way of receiving an argument must avoid copying the converted value.
   m.def("trackedCopies", [] { return g_tracked_copies; });

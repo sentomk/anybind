@@ -918,19 +918,35 @@ std::string ts_format(ts_dir dir = ts_dir::out, const ts_context& ctx = {}) {
 
 /* === Map and variant casters === */
 
-/* Whether `value` is what `Object.prototype[key]` holds, i.e. an inherited built-in. */
-inline bool is_object_prototype_member(napi_env env, napi_value key, napi_value value) {
+/*
+ * Whether `key`, looked up through the prototype chain of `obj`, belongs to the
+ * intrinsic `Object.prototype` (built-ins such as `constructor`, `toString` or
+ * the `__proto__` accessor) rather than to `obj` or one of its own prototypes.
+ */
+inline bool inherited_from_object_prototype(napi_env env, napi_value obj, napi_value key) {
   // The prototype of a fresh object is the intrinsic `Object.prototype`, even if
   // the global `Object` has been replaced.
   napi_value probe = nullptr;
   check(env, napi_create_object(env, &probe));
-  napi_value proto = nullptr;
-  check(env, napi_get_prototype(env, probe, &proto));
-  napi_value builtin = nullptr;
-  check(env, napi_get_property(env, proto, key, &builtin));
-  bool same = false;
-  check(env, napi_strict_equals(env, value, builtin, &same));
-  return same;
+  napi_value object_proto = nullptr;
+  check(env, napi_get_prototype(env, probe, &object_proto));
+  napi_value current = nullptr;
+  check(env, napi_get_prototype(env, obj, &current));
+  // Bounded so a Proxy whose `getPrototypeOf` keeps returning new objects cannot loop forever.
+  for (int depth = 0; depth < 1024; ++depth) {
+    napi_valuetype type = napi_undefined;
+    check(env, napi_typeof(env, current, &type));
+    if (type != napi_object && type != napi_function) return false;
+    bool own = false;
+    check(env, napi_has_own_property(env, current, key, &own));
+    if (own) {
+      bool same = false;
+      check(env, napi_strict_equals(env, current, object_proto, &same));
+      return same;
+    }
+    check(env, napi_get_prototype(env, current, &current));
+  }
+  return false;
 }
 
 inline void expect_plain_object(napi_env env, napi_value value) {
@@ -938,6 +954,30 @@ inline void expect_plain_object(napi_env env, napi_value value) {
   bool is_arr = false;
   check(env, napi_is_array(env, value, &is_arr));
   if (is_arr) throw type_error("expected object");
+}
+
+/*
+ * Defines `obj[key] = value` as an own, writable, enumerable, configurable
+ * data property. Unlike assignment (`napi_set_property`), a `__proto__` key
+ * creates a property instead of replacing the prototype, and inherited
+ * setters are never invoked.
+ */
+inline void define_own_property(napi_env env, napi_value obj, napi_value key, napi_value value) {
+  napi_property_descriptor desc{};
+  desc.name = key;
+  desc.value = value;
+  desc.attributes =
+      static_cast<napi_property_attributes>(napi_writable | napi_enumerable | napi_configurable);
+  check(env, napi_define_properties(env, obj, 1, &desc));
+}
+
+inline void define_own_property(napi_env env, napi_value obj, const char* key, napi_value value) {
+  napi_property_descriptor desc{};
+  desc.utf8name = key;
+  desc.value = value;
+  desc.attributes =
+      static_cast<napi_property_attributes>(napi_writable | napi_enumerable | napi_configurable);
+  check(env, napi_define_properties(env, obj, 1, &desc));
 }
 
 template <typename Map, typename V>
@@ -981,7 +1021,7 @@ napi_value map_to_js(napi_env env, const Map& value) {
     napi_value js_key = nullptr;
     check(env, napi_create_string_utf8(env, k.data(), k.size(), &js_key));
     napi_value js_val = type_caster<elem_t>::to_js(env, v);
-    check(env, napi_set_property(env, obj, js_key, js_val));
+    define_own_property(env, obj, js_key, js_val);
   }
   return obj;
 }
@@ -1962,7 +2002,7 @@ struct type_caster<T, std::enable_if_t<anybind::struct_traits<T>::is_specialized
     // Inherited properties count (e.g. getters on a class prototype), except
     // the built-ins every object inherits, such as `constructor` or `toString`.
     const bool missing =
-        val_type == napi_undefined || (!own && is_object_prototype_member(env, js_key, js_val));
+        val_type == napi_undefined || (!own && inherited_from_object_prototype(env, obj, js_key));
     if (missing) {
       if constexpr (traits_t::has_defaults) {
         // Keep the C++ default member initializer from `T out{}`.
@@ -1984,19 +2024,15 @@ struct type_caster<T, std::enable_if_t<anybind::struct_traits<T>::is_specialized
   template <typename Field>
   static void write_field(napi_env env, napi_value obj, const T& value, const Field& f) {
     using ValT = typename Field::value_type;
-    const char* raw_name = Field::name;
+    const auto& member = value.*(f.ptr);
+    napi_value js_val = nullptr;
     if constexpr (Field::is_optional) {
-      if (!(value.*(f.ptr)).has_value()) return;
-      napi_value js_key = nullptr;
-      check(env, napi_create_string_utf8(env, raw_name, NAPI_AUTO_LENGTH, &js_key));
-      napi_value js_val = type_caster<ValT>::to_js(env, *(value.*(f.ptr)));
-      check(env, napi_set_property(env, obj, js_key, js_val));
+      if (!member.has_value()) return;
+      js_val = type_caster<ValT>::to_js(env, *member);
     } else {
-      napi_value js_key = nullptr;
-      check(env, napi_create_string_utf8(env, raw_name, NAPI_AUTO_LENGTH, &js_key));
-      napi_value js_val = type_caster<ValT>::to_js(env, value.*(f.ptr));
-      check(env, napi_set_property(env, obj, js_key, js_val));
+      js_val = type_caster<ValT>::to_js(env, member);
     }
+    define_own_property(env, obj, Field::name, js_val);
   }
 
   template <size_t... I>
