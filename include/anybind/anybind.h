@@ -1735,6 +1735,158 @@ class ref {
 
 namespace detail {
 
+template <typename T>
+struct is_std_optional : std::false_type {};
+
+template <typename T>
+struct is_std_optional<std::optional<T>> : std::true_type {};
+
+template <typename T>
+struct unwrap_optional {
+  using type = T;
+};
+
+template <typename T>
+struct unwrap_optional<std::optional<T>> {
+  using type = T;
+};
+
+}  // namespace detail
+
+/* === Plain struct object conversion === */
+
+/** Metadata binding one C++ struct member to a JS object property. */
+template <const char* Name, typename Struct, typename Member>
+struct struct_field {
+  static constexpr const char* name = Name;
+  using struct_type = Struct;
+  using member_type = Member;
+  using value_type = typename detail::unwrap_optional<detail::intrinsic_t<Member>>::type;
+  static constexpr bool is_optional = detail::is_std_optional<detail::intrinsic_t<Member>>::value;
+
+  Member Struct::* ptr;
+};
+
+/** Helper for declaring a `struct_field` inside a manual `struct_traits<T>` specialization. */
+template <const char* Name, typename Struct, typename Member>
+constexpr struct_field<Name, Struct, Member> make_field(Member Struct::* ptr) noexcept {
+  return {ptr};
+}
+
+/**
+ * Specialize this trait (or use `ANYBIND_STRUCT` / `ANYBIND_STRUCT_DEFAULTS`)
+ * to convert a plain C++ struct to and from a plain JavaScript object.
+ */
+template <typename T, typename SFINAE = void>
+struct struct_traits {
+  static constexpr bool is_specialized = false;
+};
+
+namespace detail {
+
+template <typename FieldsTuple, bool HasDefaults>
+struct struct_ts;
+
+template <typename... Fields, bool HasDefaults>
+struct struct_ts<std::tuple<Fields...>, HasDefaults> {
+  using in_obj = anybind::ts::object<
+      anybind::ts::field<Fields::name, ts_of<typename Fields::value_type>,
+                         Fields::is_optional || HasDefaults>...>;
+  using out_obj = anybind::ts::object<
+      anybind::ts::field<Fields::name, ts_of<typename Fields::value_type>,
+                         Fields::is_optional>...>;
+  using type = std::conditional_t<HasDefaults, anybind::ts::io<in_obj, out_obj>, out_obj>;
+};
+
+template <typename T>
+struct type_caster<T, std::enable_if_t<anybind::struct_traits<T>::is_specialized>> {
+  using traits_t = anybind::struct_traits<T>;
+  using fields_t = decltype(traits_t::fields());
+  using ts = typename struct_ts<fields_t, traits_t::has_defaults>::type;
+
+  template <typename Field>
+  static void read_field(napi_env env, napi_value obj, T& out, const Field& f) {
+    using ValT = typename Field::value_type;
+    static_assert(
+        std::is_same_v<storage_t<ValT>, intrinsic_t<ValT>>,
+        "anybind: plain struct fields must be owning types (use std::string, not std::string_view)");
+    const char* raw_name = Field::name;
+    napi_value js_key = nullptr;
+    check(env, napi_create_string_utf8(env, raw_name, NAPI_AUTO_LENGTH, &js_key));
+    bool has_prop = false;
+    check(env, napi_has_property(env, obj, js_key, &has_prop));
+    napi_value js_val = nullptr;
+    napi_valuetype val_type = napi_undefined;
+    if (has_prop) {
+      check(env, napi_get_property(env, obj, js_key, &js_val));
+      check(env, napi_typeof(env, js_val, &val_type));
+    }
+    if (!has_prop || val_type == napi_undefined) {
+      if constexpr (traits_t::has_defaults) {
+        // Keep the C++ default member initializer from `T out{}`.
+        return;
+      } else if constexpr (Field::is_optional) {
+        out.*(f.ptr) = std::nullopt;
+        return;
+      } else {
+        throw type_error(std::string("property '") + raw_name + "': missing required property");
+      }
+    }
+    try {
+      out.*(f.ptr) = type_caster<ValT>::from_js(env, js_val);
+    } catch (const type_error& e) {
+      throw type_error(std::string("property '") + raw_name + "': " + e.what());
+    }
+  }
+
+  template <typename Field>
+  static void write_field(napi_env env, napi_value obj, const T& value, const Field& f) {
+    using ValT = typename Field::value_type;
+    const char* raw_name = Field::name;
+    if constexpr (Field::is_optional) {
+      if (!(value.*(f.ptr)).has_value()) return;
+      napi_value js_key = nullptr;
+      check(env, napi_create_string_utf8(env, raw_name, NAPI_AUTO_LENGTH, &js_key));
+      napi_value js_val = type_caster<ValT>::to_js(env, *(value.*(f.ptr)));
+      check(env, napi_set_property(env, obj, js_key, js_val));
+    } else {
+      napi_value js_key = nullptr;
+      check(env, napi_create_string_utf8(env, raw_name, NAPI_AUTO_LENGTH, &js_key));
+      napi_value js_val = type_caster<ValT>::to_js(env, value.*(f.ptr));
+      check(env, napi_set_property(env, obj, js_key, js_val));
+    }
+  }
+
+  template <size_t... I>
+  static T from_js_impl(napi_env env, napi_value value, [[maybe_unused]] const fields_t& fields,
+                        std::index_sequence<I...>) {
+    T out{};
+    (read_field(env, value, out, std::get<I>(fields)), ...);
+    return out;
+  }
+
+  template <size_t... I>
+  static napi_value to_js_impl(napi_env env, const T& value,
+                               [[maybe_unused]] const fields_t& fields, std::index_sequence<I...>) {
+    napi_value obj = nullptr;
+    check(env, napi_create_object(env, &obj));
+    (write_field(env, obj, value, std::get<I>(fields)), ...);
+    return obj;
+  }
+
+  static T from_js(napi_env env, napi_value value) {
+    expect_plain_object(env, value);
+    constexpr auto fields = traits_t::fields();
+    return from_js_impl(env, value, fields,
+                        std::make_index_sequence<std::tuple_size_v<fields_t>>{});
+  }
+
+  static napi_value to_js(napi_env env, const T& value) {
+    constexpr auto fields = traits_t::fields();
+    return to_js_impl(env, value, fields, std::make_index_sequence<std::tuple_size_v<fields_t>>{});
+  }
+};
+
 template <>
 struct type_caster<anybind::value> {
   using ts = anybind::ts::unknown;
@@ -1867,3 +2019,129 @@ inline napi_value init_module(napi_env env, napi_value exports, void (*init)(mod
     return ::anybind::detail::init_module(env, exports, &anybind_init_##name); \
   }                                                                            \
   static void anybind_init_##name(::anybind::module_& variable)
+
+/* === Plain struct registration macros (1 to 32 fields, MSVC-safe) === */
+
+#define ANYBIND_PP_EXPAND(x) x
+#define ANYBIND_PP_CAT_IMPL(a, b) a##b
+#define ANYBIND_PP_CAT(a, b) ANYBIND_PP_CAT_IMPL(a, b)
+
+#define ANYBIND_PP_NARGS_IMPL(                                                                    \
+    p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15, p16, p17, p18, p19, p20,    \
+    p21, p22, p23, p24, p25, p26, p27, p28, p29, p30, p31, p32, n, ...)                           \
+  n
+#define ANYBIND_PP_NARGS(...)                                                                     \
+  ANYBIND_PP_EXPAND(ANYBIND_PP_NARGS_IMPL(                                                        \
+      __VA_ARGS__, 32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14,    \
+      13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0))
+
+#define ANYBIND_PP_MAP_1(fn, c, x) fn(c, x)
+#define ANYBIND_PP_MAP_2(fn, c, x, ...) fn(c, x) ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_1(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_3(fn, c, x, ...) fn(c, x) ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_2(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_4(fn, c, x, ...) fn(c, x) ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_3(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_5(fn, c, x, ...) fn(c, x) ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_4(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_6(fn, c, x, ...) fn(c, x) ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_5(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_7(fn, c, x, ...) fn(c, x) ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_6(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_8(fn, c, x, ...) fn(c, x) ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_7(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_9(fn, c, x, ...) fn(c, x) ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_8(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_10(fn, c, x, ...) fn(c, x) ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_9(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_11(fn, c, x, ...) fn(c, x) ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_10(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_12(fn, c, x, ...) fn(c, x) ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_11(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_13(fn, c, x, ...) fn(c, x) ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_12(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_14(fn, c, x, ...) fn(c, x) ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_13(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_15(fn, c, x, ...) fn(c, x) ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_14(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_16(fn, c, x, ...) fn(c, x) ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_15(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_17(fn, c, x, ...) fn(c, x) ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_16(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_18(fn, c, x, ...) fn(c, x) ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_17(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_19(fn, c, x, ...) fn(c, x) ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_18(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_20(fn, c, x, ...) fn(c, x) ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_19(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_21(fn, c, x, ...) fn(c, x) ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_20(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_22(fn, c, x, ...) fn(c, x) ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_21(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_23(fn, c, x, ...) fn(c, x) ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_22(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_24(fn, c, x, ...) fn(c, x) ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_23(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_25(fn, c, x, ...) fn(c, x) ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_24(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_26(fn, c, x, ...) fn(c, x) ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_25(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_27(fn, c, x, ...) fn(c, x) ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_26(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_28(fn, c, x, ...) fn(c, x) ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_27(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_29(fn, c, x, ...) fn(c, x) ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_28(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_30(fn, c, x, ...) fn(c, x) ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_29(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_31(fn, c, x, ...) fn(c, x) ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_30(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_32(fn, c, x, ...) fn(c, x) ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_31(fn, c, __VA_ARGS__))
+
+#define ANYBIND_PP_MAP_COMMA_1(fn, c, x) fn(c, x)
+#define ANYBIND_PP_MAP_COMMA_2(fn, c, x, ...) fn(c, x), ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_COMMA_1(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_COMMA_3(fn, c, x, ...) fn(c, x), ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_COMMA_2(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_COMMA_4(fn, c, x, ...) fn(c, x), ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_COMMA_3(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_COMMA_5(fn, c, x, ...) fn(c, x), ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_COMMA_4(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_COMMA_6(fn, c, x, ...) fn(c, x), ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_COMMA_5(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_COMMA_7(fn, c, x, ...) fn(c, x), ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_COMMA_6(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_COMMA_8(fn, c, x, ...) fn(c, x), ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_COMMA_7(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_COMMA_9(fn, c, x, ...) fn(c, x), ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_COMMA_8(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_COMMA_10(fn, c, x, ...) fn(c, x), ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_COMMA_9(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_COMMA_11(fn, c, x, ...) fn(c, x), ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_COMMA_10(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_COMMA_12(fn, c, x, ...) fn(c, x), ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_COMMA_11(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_COMMA_13(fn, c, x, ...) fn(c, x), ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_COMMA_12(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_COMMA_14(fn, c, x, ...) fn(c, x), ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_COMMA_13(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_COMMA_15(fn, c, x, ...) fn(c, x), ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_COMMA_14(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_COMMA_16(fn, c, x, ...) fn(c, x), ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_COMMA_15(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_COMMA_17(fn, c, x, ...) fn(c, x), ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_COMMA_16(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_COMMA_18(fn, c, x, ...) fn(c, x), ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_COMMA_17(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_COMMA_19(fn, c, x, ...) fn(c, x), ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_COMMA_18(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_COMMA_20(fn, c, x, ...) fn(c, x), ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_COMMA_19(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_COMMA_21(fn, c, x, ...) fn(c, x), ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_COMMA_20(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_COMMA_22(fn, c, x, ...) fn(c, x), ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_COMMA_21(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_COMMA_23(fn, c, x, ...) fn(c, x), ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_COMMA_22(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_COMMA_24(fn, c, x, ...) fn(c, x), ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_COMMA_23(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_COMMA_25(fn, c, x, ...) fn(c, x), ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_COMMA_24(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_COMMA_26(fn, c, x, ...) fn(c, x), ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_COMMA_25(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_COMMA_27(fn, c, x, ...) fn(c, x), ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_COMMA_26(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_COMMA_28(fn, c, x, ...) fn(c, x), ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_COMMA_27(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_COMMA_29(fn, c, x, ...) fn(c, x), ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_COMMA_28(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_COMMA_30(fn, c, x, ...) fn(c, x), ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_COMMA_29(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_COMMA_31(fn, c, x, ...) fn(c, x), ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_COMMA_30(fn, c, __VA_ARGS__))
+#define ANYBIND_PP_MAP_COMMA_32(fn, c, x, ...) fn(c, x), ANYBIND_PP_EXPAND(ANYBIND_PP_MAP_COMMA_31(fn, c, __VA_ARGS__))
+
+#define ANYBIND_PP_MAP(fn, c, ...) \
+  ANYBIND_PP_EXPAND(ANYBIND_PP_CAT(ANYBIND_PP_MAP_, ANYBIND_PP_NARGS(__VA_ARGS__))(fn, c, __VA_ARGS__))
+
+#define ANYBIND_PP_MAP_COMMA(fn, c, ...) \
+  ANYBIND_PP_EXPAND(                     \
+      ANYBIND_PP_CAT(ANYBIND_PP_MAP_COMMA_, ANYBIND_PP_NARGS(__VA_ARGS__))(fn, c, __VA_ARGS__))
+
+#define ANYBIND_DETAIL_STRUCT_NAME(Type, field) static constexpr char anybind_name_##field[] = #field;
+#define ANYBIND_DETAIL_STRUCT_ENTRY(Type, field) ::anybind::make_field<anybind_name_##field>(&Type::field)
+
+#define ANYBIND_DETAIL_DEFINE_STRUCT(Type, HasDefaults, ...)                                      \
+  namespace anybind {                                                                             \
+  template <>                                                                                     \
+  struct struct_traits<Type> {                                                                    \
+    static constexpr bool is_specialized = true;                                                  \
+    static constexpr bool has_defaults = (HasDefaults);                                           \
+    ANYBIND_PP_MAP(ANYBIND_DETAIL_STRUCT_NAME, Type, __VA_ARGS__)                                 \
+    static constexpr auto fields() noexcept {                                                     \
+      return std::make_tuple(ANYBIND_PP_MAP_COMMA(ANYBIND_DETAIL_STRUCT_ENTRY, Type, __VA_ARGS__)); \
+    }                                                                                             \
+  };                                                                                              \
+  } /* namespace anybind */                                                                       \
+  static_assert(true, "")
+
+/**
+ * Registers a plain C++ struct for value-based conversion to/from JS objects.
+ * Invoke at global scope. Non-`std::optional` fields are required on JS input;
+ * `std::optional<T>` fields become optional TS properties (`name?: T`).
+ *
+ *   struct Point { double x; double y; };
+ *   ANYBIND_STRUCT(Point, x, y);
+ */
+#define ANYBIND_STRUCT(Type, ...) ANYBIND_DETAIL_DEFINE_STRUCT(Type, false, __VA_ARGS__)
+
+/**
+ * Registers a plain C++ struct whose fields have default member initializers.
+ * Missing or `undefined` JS properties keep their C++ default values, and
+ * TypeScript declarations mark all fields optional in parameter position
+ * while keeping non-`std::optional` fields required in return position.
+ *
+ *   struct Options { bool gfm = true; bool xhtml = false; };
+ *   ANYBIND_STRUCT_DEFAULTS(Options, gfm, xhtml);
+ */
+#define ANYBIND_STRUCT_DEFAULTS(Type, ...) ANYBIND_DETAIL_DEFINE_STRUCT(Type, true, __VA_ARGS__)

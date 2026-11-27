@@ -67,7 +67,7 @@ with this?_ It ships only once every release criterion below is met.
    - [ ] `.d.ts` generation at build time, without loading the `.node` (needed for
          cross-compilation, e.g. HarmonyOS or Android arm64 built on an x86 host).
 2. **Type system**
-   - [ ] `std::vector` / `std::array` ↔ `Array`, `std::optional` ↔ `T | undefined`,
+   - [x] `std::vector` / `std::array` ↔ `Array`, `std::optional` ↔ `T | undefined`,
          `std::variant` ↔ union, `std::map` / plain structs ↔ objects, `std::string_view`
    - [x] 64-bit integers ↔ `bigint`
    - [ ] Synchronous callbacks: `std::function` ↔ JS functions

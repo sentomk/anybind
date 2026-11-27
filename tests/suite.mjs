@@ -699,4 +699,123 @@ export function registerTests(test) {
       /export function optU64\(v\?: number \| bigint \| undefined\): bigint \| undefined;/,
     );
   });
+
+  test("converts plain structs to and from JS objects", () => {
+    const st = require(
+      fileURLToPath(
+        new URL("../build/tests/test_struct.node", import.meta.url),
+      ),
+    );
+
+    // Basic required-field struct.
+    assert.deepEqual(st.translate({ x: 1, y: 2 }, 3, -1), { x: 4, y: 1 });
+    assert.throws(() => st.translate({ x: 1 }), {
+      name: "TypeError",
+      message: /argument 1 \(p\): property 'y': missing required property/,
+    });
+    assert.throws(() => st.translate({ x: 1, y: undefined }), {
+      name: "TypeError",
+      message: /argument 1 \(p\): property 'y': missing required property/,
+    });
+    assert.throws(() => st.translate({ x: 1, y: "bad" }), {
+      name: "TypeError",
+      message: /argument 1 \(p\): property 'y': expected number/,
+    });
+    assert.throws(() => st.translate([1, 2]), {
+      name: "TypeError",
+      message: /argument 1 \(p\): expected object/,
+    });
+    assert.throws(() => st.translate(null), TypeError);
+
+    // Struct with std::optional fields (omitted on output when nullopt).
+    const u1 = st.echoUser({ name: "Ada" });
+    assert.deepEqual(u1, { name: "Ada" });
+    assert.deepEqual(Object.keys(u1), ["name"]);
+    assert.deepEqual(st.echoUser({ name: "Ada", age: 36, bio: undefined }), {
+      name: "Ada",
+      age: 36,
+    });
+    assert.throws(() => st.echoUser({ name: "Ada", age: "old" }), {
+      name: "TypeError",
+      message: /argument 1 \(user\): property 'age': expected number/,
+    });
+
+    // Struct with C++ default member initializers (ANYBIND_STRUCT_DEFAULTS).
+    assert.deepEqual(st.resolveOptions(), {
+      gfm: true,
+      xhtml: false,
+      tabWidth: 4,
+    });
+    assert.deepEqual(st.resolveOptions({}), {
+      gfm: true,
+      xhtml: false,
+      tabWidth: 4,
+    });
+    assert.deepEqual(
+      st.resolveOptions({
+        gfm: undefined,
+        xhtml: true,
+        baseUrl: "https://example.com",
+      }),
+      {
+        gfm: true,
+        xhtml: true,
+        tabWidth: 4,
+        baseUrl: "https://example.com",
+      },
+    );
+    assert.throws(() => st.resolveOptions({ gfm: 123 }), {
+      name: "TypeError",
+      message: /argument 1 \(options\): property 'gfm': expected boolean/,
+    });
+
+    // Nested structs, vectors, bigint, variant, anonymous namespace, custom keys.
+    assert.deepEqual(
+      st.echoPolygon({
+        id: 42,
+        origin: { x: 0, y: 0 },
+        vertices: [
+          { x: 1, y: 0 },
+          { x: 0, y: 1 },
+        ],
+      }),
+      {
+        id: 42n,
+        origin: { x: 0, y: 0 },
+        vertices: [
+          { x: 1, y: 0 },
+          { x: 0, y: 1 },
+        ],
+      },
+    );
+    assert.deepEqual(st.pointOrLabel({ x: 3, y: 4 }), { x: 3, y: 4 });
+    assert.equal(st.pointOrLabel("center"), "center");
+    assert.deepEqual(st.flipLocal({ enabled: false }), { enabled: true });
+    assert.deepEqual(st.echoCustom({ "kebab-key": "ok", count: 2 }), {
+      "kebab-key": "ok",
+      count: 2,
+    });
+
+    // Generated .d.ts signatures.
+    assert.match(
+      st.__anybind_dts__,
+      /export function translate\(p: \{ x: number; y: number \}, dx\?: number, dy\?: number\): \{ x: number; y: number \};/,
+    );
+    assert.match(
+      st.__anybind_dts__,
+      /export function echoUser\(user: \{ name: string; age\?: number; bio\?: string \}\): \{ name: string; age\?: number; bio\?: string \};/,
+    );
+    assert.match(
+      st.__anybind_dts__,
+      /export function resolveOptions\(options\?: \{ gfm\?: boolean; xhtml\?: boolean; tabWidth\?: number; baseUrl\?: string \}\): \{ gfm: boolean; xhtml: boolean; tabWidth: number; baseUrl\?: string \};/,
+    );
+    assert.match(
+      st.__anybind_dts__,
+      /export function echoPolygon\(poly: \{ id: number \| bigint; origin: \{ x: number; y: number \}; vertices: \{ x: number; y: number \}\[\] \}\): \{ id: bigint; origin: \{ x: number; y: number \}; vertices: \{ x: number; y: number \}\[\] \};/,
+    );
+    assert.match(
+      st.__anybind_dts__,
+      /export function echoCustom\(c: \{ "kebab-key": string; count: number \}\): \{ "kebab-key": string; count: number \};/,
+    );
+  });
 }
