@@ -42,7 +42,8 @@ with this?_ It ships only once every release criterion below is met.
      - First node set, limited to what 0.1 needs: primitives, literals, `array`, `tuple`,
        `union_`, `undefined`, object/record, `function`, `bound<T>` (placeholder for a
        bound class) and `io<In, Out>` (different parameter and return types, e.g.
-       `int64_t` is `number | bigint` as a parameter and `bigint` as a return value).
+       `anybind::bigint<T>` is `number | bigint` as a parameter and `bigint` as a return
+       value).
      - Optional parameters stay a function-signature concern; the existing `arg` default
        value logic is kept.
      - Serializers are separate from the tree: a compile-time encoder writes constant bytes
@@ -69,7 +70,9 @@ with this?_ It ships only once every release criterion below is met.
 2. **Type system**
    - [x] `std::vector` / `std::array` ↔ `Array`, `std::optional` ↔ `T | undefined`,
          `std::variant` ↔ union, `std::map` / plain structs ↔ objects, `std::string_view`
-   - [x] 64-bit integers ↔ `bigint`
+   - [x] 64-bit integers ↔ `number` (safe range, so `size_t` results stay plain numbers and
+         the `.d.ts` is the same on every platform); `anybind::bigint<T>` ↔ `bigint` for full
+         precision
    - [ ] Synchronous callbacks: `std::function` ↔ JS functions
    - [ ] Function overloads, emitted as TypeScript overloads
 3. **Classes**

@@ -80,6 +80,14 @@ ANYBIND_MODULE(test_stl, m) {
         return out;
       },
       "name"_a = std::nullopt, "repeat"_a);
+  // Trailing `std::optional` parameters may be omitted even without a default.
+  m.def(
+      "optTail", [](int a, std::optional<int> b) { return a + b.value_or(100); }, "a"_a, "b"_a);
+  m.def("optBoth", [](std::optional<int> a, std::optional<int> b) {
+    return a.value_or(1) * 10 + b.value_or(2);
+  });
+  m.def(
+      "optLead", [](std::optional<int> a, int b) { return a.value_or(0) + b; }, "a"_a, "b"_a);
 
   // `std::vector<T>`: primitives, `vector<bool>`, nested vectors, vector of optionals.
   m.def(
@@ -164,7 +172,8 @@ ANYBIND_MODULE(test_stl, m) {
       },
       "v"_a);
   m.def(
-      "bigOrDouble", [](const std::variant<int64_t, double>& v) { return v; }, "v"_a);
+      "bigOrDouble", [](const std::variant<anybind::bigint<int64_t>, double>& v) { return v; },
+      "v"_a);
   m.def(
       "listVariant",
       [](const std::variant<std::vector<int>, std::vector<std::string>>& v) { return v; }, "v"_a);

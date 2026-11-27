@@ -43,6 +43,20 @@ struct LocalFlag {
 
 }  // namespace
 
+/* Field names that also exist on Object.prototype must not read the built-ins. */
+struct ProtoRequired {
+  int constructor = 0;
+};
+
+struct ProtoOptional {
+  std::optional<std::string> toString;
+};
+
+struct ProtoDefaults {
+  int constructor = 7;
+  int valueOf = 8;
+};
+
 struct CustomKeys {
   std::string kebabValue;
   int count = 0;
@@ -73,6 +87,9 @@ ANYBIND_STRUCT_DEFAULTS(RenderOptions, gfm, xhtml, tabWidth, baseUrl);
 ANYBIND_STRUCT(Polygon, id, origin, vertices);
 ANYBIND_STRUCT(LocalFlag, enabled);
 ANYBIND_STRUCT(Tracked, n);
+ANYBIND_STRUCT(ProtoRequired, constructor);
+ANYBIND_STRUCT(ProtoOptional, toString);
+ANYBIND_STRUCT_DEFAULTS(ProtoDefaults, constructor, valueOf);
 
 namespace anybind {
 template <>
@@ -107,6 +124,13 @@ ANYBIND_MODULE(test_struct, m) {
       "flipLocal", [](LocalFlag f) { return LocalFlag{!f.enabled}; }, "flag"_a);
   m.def(
       "echoCustom", [](const CustomKeys& c) { return c; }, "c"_a);
+
+  m.def(
+      "echoProtoRequired", [](const ProtoRequired& v) { return v; }, "v"_a);
+  m.def(
+      "echoProtoOptional", [](const ProtoOptional& v) { return v; }, "v"_a);
+  m.def(
+      "echoProtoDefaults", [](const ProtoDefaults& v) { return v; }, "v"_a);
 
   // Every way of receiving an argument must avoid copying the converted value.
   m.def("trackedCopies", [] { return g_tracked_copies; });

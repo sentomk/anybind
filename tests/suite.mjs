@@ -36,7 +36,7 @@ export function registerTests(test) {
     assert.equal(m.scale(1.5, 2), 3);
     assert.equal(m.greet("anybind"), "hello, anybind");
     assert.equal(m.negate(true), false);
-    assert.equal(m.twice64(2 ** 40), 2n ** 41n);
+    assert.equal(m.twice64(2 ** 40), 2 ** 41);
     assert.equal(m.noop(), undefined);
   });
 
@@ -481,6 +481,33 @@ export function registerTests(test) {
     });
     assert.equal(stl.optGreeting(undefined, 2), "guest,guest");
     assert.equal(stl.optGreeting("ada", 2), "ada,ada");
+    assert.equal(stl.optTail(1), 101);
+    assert.equal(stl.optTail(1, 2), 3);
+    assert.equal(stl.optTail(1, undefined), 101);
+    assert.equal(stl.optBoth(), 12);
+    assert.equal(stl.optBoth(3), 32);
+    assert.equal(stl.optLead(undefined, 5), 5);
+    assert.throws(() => stl.optTail(), {
+      name: "TypeError",
+      message: /expected 1 to 2 argument\(s\), got 0/,
+    });
+    // A non-trailing optional stays positional: it accepts undefined but cannot be skipped.
+    assert.throws(() => stl.optLead(), {
+      name: "TypeError",
+      message: /expected 2 argument\(s\), got 0/,
+    });
+    assert.match(
+      stl.__anybind_dts__,
+      /export function optTail\(a: number, b\?: number \| undefined\): number;/,
+    );
+    assert.match(
+      stl.__anybind_dts__,
+      /export function optBoth\(arg0\?: number \| undefined, arg1\?: number \| undefined\): number;/,
+    );
+    assert.match(
+      stl.__anybind_dts__,
+      /export function optLead\(a: number \| undefined, b: number\): number;/,
+    );
 
     // std::vector
     assert.equal(stl.sumInts([1, 2, 3, 4]), 10);
@@ -594,6 +621,7 @@ export function registerTests(test) {
     assert.equal(stl.intOrDouble(5), "int");
     assert.equal(stl.intOrDouble(5.5), "double");
     assert.equal(stl.bigOrDouble(10n), 10n);
+    assert.equal(stl.bigOrDouble(10), 10n);
     assert.equal(stl.bigOrDouble(2.5), 2.5);
     assert.deepEqual(stl.listVariant([1, 2]), [1, 2]);
     assert.deepEqual(stl.listVariant(["a", "b"]), ["a", "b"]);
@@ -629,7 +657,7 @@ export function registerTests(test) {
     );
   });
 
-  test("converts 64-bit integers with bigint and safe JS numbers", () => {
+  test("converts plain 64-bit integers to JS numbers", () => {
     const bi = require(
       fileURLToPath(
         new URL("../build/tests/test_bigint.node", import.meta.url),
@@ -640,32 +668,38 @@ export function registerTests(test) {
     const I64_MAX = (1n << 63n) - 1n;
     const U64_MAX = (1n << 64n) - 1n;
 
-    // Defaults and full 64-bit precision round-trips.
-    assert.equal(bi.echoI64(), -1n);
-    assert.equal(bi.echoI64(I64_MIN), I64_MIN);
-    assert.equal(bi.echoI64(I64_MAX), I64_MAX);
-    assert.equal(bi.echoI64(Number.MAX_SAFE_INTEGER), 9007199254740991n);
-    assert.equal(bi.echoI64(Number.MIN_SAFE_INTEGER), -9007199254740991n);
+    // Safe-range values round-trip as numbers; bigint inputs are accepted too.
+    assert.equal(bi.echoI64(), -1);
+    assert.equal(bi.echoI64(Number.MAX_SAFE_INTEGER), Number.MAX_SAFE_INTEGER);
+    assert.equal(bi.echoI64(Number.MIN_SAFE_INTEGER), Number.MIN_SAFE_INTEGER);
+    assert.equal(bi.echoI64(5n), 5);
+    assert.equal(bi.echoU64(-0), 0);
+    assert.equal(bi.echoSize(7), 7);
 
-    assert.equal(bi.echoU64(), U64_MAX);
-    assert.equal(bi.echoU64(0), 0n);
-    assert.equal(bi.echoU64(-0), 0n);
-    assert.equal(bi.echoU64(U64_MAX), U64_MAX);
-    assert.equal(bi.echoU64(Number.MAX_SAFE_INTEGER), 9007199254740991n);
+    // size_t results behave like ordinary numbers.
+    assert.equal(bi.count(), 3);
+    assert.equal(bi.count() + 1, 4);
+    assert.equal([10, 20, 30, 40][bi.count()], 40);
 
-    // Mixing safe numbers and bigints in arithmetic.
-    assert.equal(bi.addI64(10, 9007199254740993n), 9007199254741003n);
-    assert.equal(bi.addU64(1n << 62n, 42), (1n << 62n) + 42n);
-
-    // Composition with std::vector and std::optional.
-    assert.deepEqual(bi.incAllI64([1, 9007199254740993n, -10]), [
-      2n,
-      9007199254740994n,
-      -9n,
-    ]);
+    assert.equal(bi.addI64(1, 2n), 3);
+    assert.deepEqual(bi.incAllI64([1, 2n, -10]), [2, 3, -9]);
     assert.equal(bi.optU64(), undefined);
-    assert.equal(bi.optU64(100), 100n);
-    assert.equal(bi.optU64(U64_MAX), U64_MAX);
+    assert.equal(bi.optU64(100), 100);
+
+    // Results outside the safe range throw instead of losing precision.
+    const unsafe = {
+      name: "Error",
+      message:
+        /outside the safe JavaScript number range; return anybind::bigint<T>/,
+    };
+    assert.throws(() => bi.echoI64(I64_MAX), unsafe);
+    assert.throws(() => bi.echoI64(I64_MIN), unsafe);
+    assert.throws(() => bi.echoU64(U64_MAX), unsafe);
+    assert.throws(
+      () => bi.echoI64(BigInt(Number.MAX_SAFE_INTEGER) + 1n),
+      unsafe,
+    );
+    assert.throws(() => bi.addI64(10, 9007199254740993n), unsafe);
 
     // Reject out-of-range bigints, unsafe/fractional numbers, and bad types.
     assert.throws(() => bi.echoI64(I64_MAX + 1n), {
@@ -689,18 +723,67 @@ export function registerTests(test) {
       message: /argument 1 \(v\): expected number or bigint/,
     });
 
-    // Generated .d.ts uses asymmetric `number | bigint` -> `bigint`.
+    // The .d.ts says `number` on every platform.
     assert.match(
       bi.__anybind_dts__,
-      /export function echoI64\(v\?: number \| bigint\): bigint;/,
+      /export function echoI64\(v\?: number\): number;/,
     );
     assert.match(
       bi.__anybind_dts__,
-      /export function incAllI64\(nums: \(number \| bigint\)\[\]\): bigint\[\];/,
+      /export function echoSize\(v: number\): number;/,
+    );
+    assert.match(bi.__anybind_dts__, /export function count\(\): number;/);
+    assert.match(
+      bi.__anybind_dts__,
+      /export function incAllI64\(nums: number\[\]\): number\[\];/,
     );
     assert.match(
       bi.__anybind_dts__,
-      /export function optU64\(v\?: number \| bigint \| undefined\): bigint \| undefined;/,
+      /export function optU64\(v\?: number \| undefined\): number \| undefined;/,
+    );
+  });
+
+  test("converts anybind::bigint<T> with full 64-bit precision", () => {
+    const bi = require(
+      fileURLToPath(
+        new URL("../build/tests/test_bigint.node", import.meta.url),
+      ),
+    );
+
+    const I64_MIN = -(1n << 63n);
+    const I64_MAX = (1n << 63n) - 1n;
+    const U64_MAX = (1n << 64n) - 1n;
+
+    assert.equal(bi.bigI64(), -1n);
+    assert.equal(bi.bigI64(I64_MIN), I64_MIN);
+    assert.equal(bi.bigI64(I64_MAX), I64_MAX);
+    assert.equal(bi.bigI64(Number.MAX_SAFE_INTEGER), 9007199254740991n);
+    assert.equal(bi.bigU64(), U64_MAX);
+    assert.equal(bi.bigU64(0), 0n);
+    assert.equal(bi.bigAddI64(10, 9007199254740993n), 9007199254741003n);
+    assert.deepEqual(bi.bigIncAll([1, 9007199254740993n, -10]), [
+      2n,
+      9007199254740994n,
+      -9n,
+    ]);
+    assert.equal(bi.bigOptU64(), undefined);
+    assert.equal(bi.bigOptU64(U64_MAX), U64_MAX);
+
+    assert.throws(() => bi.bigI64(I64_MAX + 1n), TypeError);
+    assert.throws(() => bi.bigU64(-1), TypeError);
+    assert.throws(() => bi.bigI64(1.5), TypeError);
+
+    assert.match(
+      bi.__anybind_dts__,
+      /export function bigI64\(v\?: number \| bigint\): bigint;/,
+    );
+    assert.match(
+      bi.__anybind_dts__,
+      /export function bigIncAll\(nums: \(number \| bigint\)\[\]\): bigint\[\];/,
+    );
+    assert.match(
+      bi.__anybind_dts__,
+      /export function bigOptU64\(v\?: number \| bigint \| undefined\): bigint \| undefined;/,
     );
   });
 
@@ -773,6 +856,36 @@ export function registerTests(test) {
       message: /argument 1 \(options\): property 'gfm': expected boolean/,
     });
 
+    // Fields named like Object.prototype members ignore the inherited built-ins.
+    assert.throws(() => st.echoProtoRequired({}), {
+      name: "TypeError",
+      message:
+        /argument 1 \(v\): property 'constructor': missing required property/,
+    });
+    assert.deepEqual(st.echoProtoRequired({ constructor: 3 }), {
+      constructor: 3,
+    });
+    assert.deepEqual(st.echoProtoOptional({}), {});
+    assert.deepEqual(st.echoProtoOptional({ toString: "own" }), {
+      toString: "own",
+    });
+    assert.deepEqual(st.echoProtoDefaults({}), { constructor: 7, valueOf: 8 });
+    assert.deepEqual(st.echoProtoDefaults(Object.create(null)), {
+      constructor: 7,
+      valueOf: 8,
+    });
+
+    // Other inherited properties, such as getters on a class prototype, are read.
+    class PointLike {
+      get x() {
+        return 5;
+      }
+      get y() {
+        return 6;
+      }
+    }
+    assert.deepEqual(st.translate(new PointLike(), 1, 1), { x: 6, y: 7 });
+
     // Nested structs, vectors, bigint, variant, anonymous namespace, custom keys.
     assert.deepEqual(
       st.echoPolygon({
@@ -784,7 +897,7 @@ export function registerTests(test) {
         ],
       }),
       {
-        id: 42n,
+        id: 42,
         origin: { x: 0, y: 0 },
         vertices: [
           { x: 1, y: 0 },
@@ -815,7 +928,7 @@ export function registerTests(test) {
     );
     assert.match(
       st.__anybind_dts__,
-      /export function echoPolygon\(poly: \{ id: number \| bigint; origin: \{ x: number; y: number \}; vertices: \{ x: number; y: number \}\[\] \}\): \{ id: bigint; origin: \{ x: number; y: number \}; vertices: \{ x: number; y: number \}\[\] \};/,
+      /export function echoPolygon\(poly: \{ id: number; origin: \{ x: number; y: number \}; vertices: \{ x: number; y: number \}\[\] \}\): \{ id: number; origin: \{ x: number; y: number \}; vertices: \{ x: number; y: number \}\[\] \};/,
     );
     assert.match(
       st.__anybind_dts__,

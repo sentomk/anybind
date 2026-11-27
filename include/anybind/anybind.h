@@ -142,6 +142,24 @@ struct io {};
 
 }  // namespace ts
 
+/**
+ * A 64-bit integer that converts to and from a JavaScript `bigint`, keeping
+ * full precision. Plain 64-bit integers convert to `number` instead.
+ *
+ *  m.def("hash", [](const std::string& s) { return anybind::bigint<uint64_t>(xxh64(s)); });
+ */
+template <typename T>
+struct bigint {
+  static_assert(std::is_integral_v<T> && !std::is_same_v<T, bool> && sizeof(T) == 8,
+                "anybind::bigint<T>: T must be a 64-bit integer type such as int64_t or uint64_t");
+
+  T value{};
+
+  constexpr bigint() noexcept = default;
+  constexpr bigint(T v) noexcept : value(v) {}
+  constexpr operator T() const noexcept { return value; }
+};
+
 class module_;
 
 namespace detail {
@@ -158,8 +176,19 @@ struct type_tag {
 };
 
 template <typename T>
+struct is_std_optional : std::false_type {};
+
+template <typename T>
+struct is_std_optional<std::optional<T>> : std::true_type {};
+
+/*
+ * Unique address per type. The tag must stay mutable: identical read-only
+ * objects may be folded into one by MSVC `/OPT:ICF` or lld `--icf=all`
+ * (Release defaults), which would give every type the same ID.
+ */
+template <typename T>
 inline const void* type_id() noexcept {
-  static const char tag = 0;
+  static char tag;
   return &tag;
 }
 
@@ -258,56 +287,85 @@ struct type_caster<T, std::enable_if_t<std::is_arithmetic_v<T> && !std::is_same_
 };
 
 /*
- * 64-bit integer caster: accepts lossless JS safe numbers or bigints as
- * parameters (`number | bigint`) and always returns `bigint` to preserve full
- * 64-bit precision.
+ * Reads a JS number or bigint into a 64-bit integer. Numbers must be safe
+ * integers so that no precision is lost on the way in.
+ */
+template <typename T>
+T int64_from_js(napi_env env, napi_value value) {
+  napi_valuetype actual;
+  check(env, napi_typeof(env, value, &actual));
+  if (actual == napi_bigint) {
+    bool lossless = false;
+    if constexpr (std::is_signed_v<T>) {
+      int64_t result = 0;
+      check(env, napi_get_value_bigint_int64(env, value, &result, &lossless));
+      if (!lossless) {
+        throw type_error("expected a 64-bit signed integer (bigint out of range)");
+      }
+      return static_cast<T>(result);
+    } else {
+      uint64_t result = 0;
+      check(env, napi_get_value_bigint_uint64(env, value, &result, &lossless));
+      if (!lossless) {
+        throw type_error("expected a 64-bit unsigned integer (bigint out of range)");
+      }
+      return static_cast<T>(result);
+    }
+  }
+  if (actual == napi_number) {
+    double d = 0.0;
+    check(env, napi_get_value_double(env, value, &d));
+    // Only JS safe integers [-(2^53 - 1), 2^53 - 1] convert losslessly from number.
+    constexpr double max_safe = 9007199254740991.0;
+    const double lo = std::is_signed_v<T> ? -max_safe : 0.0;
+    if (!(d >= lo && d <= max_safe) || std::trunc(d) != d) {
+      throw type_error("expected a safe integer or bigint in the range of the C++ parameter type");
+    }
+    return static_cast<T>(d);
+  }
+  throw type_error("expected number or bigint");
+}
+
+/*
+ * Plain 64-bit integers (`int64_t`, `uint64_t`, `size_t`, `ptrdiff_t`, and
+ * `long` where it is 64-bit) map to `number`, so the generated `.d.ts` is the
+ * same on every platform. Parameters also accept a bigint at run time.
+ * Returning a value outside the safe integer range throws instead of losing
+ * precision; `anybind::bigint<T>` returns a JS bigint instead.
  */
 template <typename T>
 struct type_caster<T, std::enable_if_t<std::is_integral_v<T> && !std::is_same_v<T, bool> &&
                                        sizeof(T) == 8>> {
+  using ts = anybind::ts::number;
+  static T from_js(napi_env env, napi_value value) { return int64_from_js<T>(env, value); }
+  static napi_value to_js(napi_env env, T value) {
+    constexpr T max_safe = static_cast<T>(9007199254740991LL);
+    bool safe = value <= max_safe;
+    if constexpr (std::is_signed_v<T>) safe = safe && value >= -max_safe;
+    if (!safe) {
+      throw std::range_error(
+          "64-bit integer is outside the safe JavaScript number range; return "
+          "anybind::bigint<T> to get a bigint");
+    }
+    napi_value result = nullptr;
+    check(env, napi_create_double(env, static_cast<double>(value), &result));
+    return result;
+  }
+};
+
+template <typename T>
+struct type_caster<anybind::bigint<T>> {
   using ts = anybind::ts::io<anybind::ts::union_<anybind::ts::number, anybind::ts::bigint>,
                              anybind::ts::bigint>;
-  static T from_js(napi_env env, napi_value value) {
-    napi_valuetype actual;
-    check(env, napi_typeof(env, value, &actual));
-    if (actual == napi_bigint) {
-      bool lossless = false;
-      if constexpr (std::is_signed_v<T>) {
-        int64_t result = 0;
-        check(env, napi_get_value_bigint_int64(env, value, &result, &lossless));
-        if (!lossless) {
-          throw type_error("expected a 64-bit signed integer (bigint out of range)");
-        }
-        return static_cast<T>(result);
-      } else {
-        uint64_t result = 0;
-        check(env, napi_get_value_bigint_uint64(env, value, &result, &lossless));
-        if (!lossless) {
-          throw type_error("expected a 64-bit unsigned integer (bigint out of range)");
-        }
-        return static_cast<T>(result);
-      }
-    }
-    if (actual == napi_number) {
-      double d = 0.0;
-      check(env, napi_get_value_double(env, value, &d));
-      // Only JS safe integers [-(2^53 - 1), 2^53 - 1] convert losslessly from number.
-      constexpr double kMaxSafeInt = 9007199254740991.0;
-      const double lo = std::is_signed_v<T> ? -kMaxSafeInt : 0.0;
-      if (!(d >= lo && d <= kMaxSafeInt) || std::trunc(d) != d) {
-        throw type_error(
-            "expected a safe integer or bigint in the range of the C++ parameter type");
-      }
-      return static_cast<T>(d);
-    }
-    throw type_error("expected number or bigint");
+  static anybind::bigint<T> from_js(napi_env env, napi_value value) {
+    return anybind::bigint<T>(int64_from_js<T>(env, value));
   }
-  static napi_value to_js(napi_env env, T value) {
+  static napi_value to_js(napi_env env, anybind::bigint<T> value) {
     napi_value result = nullptr;
     if constexpr (std::is_signed_v<T>) {
-      check(env, napi_create_bigint_int64(env, static_cast<int64_t>(value), &result));
+      check(env, napi_create_bigint_int64(env, static_cast<int64_t>(value.value), &result));
     } else {
-      check(env, napi_create_bigint_uint64(env, static_cast<uint64_t>(value), &result));
+      check(env, napi_create_bigint_uint64(env, static_cast<uint64_t>(value.value), &result));
     }
     return result;
   }
@@ -860,6 +918,21 @@ std::string ts_format(ts_dir dir = ts_dir::out, const ts_context& ctx = {}) {
 
 /* === Map and variant casters === */
 
+/* Whether `value` is what `Object.prototype[key]` holds, i.e. an inherited built-in. */
+inline bool is_object_prototype_member(napi_env env, napi_value key, napi_value value) {
+  // The prototype of a fresh object is the intrinsic `Object.prototype`, even if
+  // the global `Object` has been replaced.
+  napi_value probe = nullptr;
+  check(env, napi_create_object(env, &probe));
+  napi_value proto = nullptr;
+  check(env, napi_get_prototype(env, probe, &proto));
+  napi_value builtin = nullptr;
+  check(env, napi_get_property(env, proto, key, &builtin));
+  bool same = false;
+  check(env, napi_strict_equals(env, value, builtin, &same));
+  return same;
+}
+
 inline void expect_plain_object(napi_env env, napi_value value) {
   expect_type(env, value, napi_object, "object");
   bool is_arr = false;
@@ -1267,8 +1340,11 @@ struct slots_for_list<type_list<A...>> {
 template <typename SlotsTuple, size_t... I>
 size_t compute_min_args([[maybe_unused]] const SlotsTuple& slots, std::index_sequence<I...>) {
   size_t min_args = 0;
+  // A trailing parameter may be omitted if it has a default or is `std::optional`.
   [[maybe_unused]] auto check_one = [&](size_t idx, const auto& slot) {
-    if (!slot.default_value.has_value()) min_args = idx + 1;
+    using slot_t = intrinsic_t<decltype(slot)>;
+    using value_t = typename decltype(slot_t::default_value)::value_type;
+    if (!slot.default_value.has_value() && !is_std_optional<value_t>::value) min_args = idx + 1;
   };
   (check_one(I, std::get<I>(slots)), ...);
   return min_args;
@@ -1808,12 +1884,6 @@ class ref {
 namespace detail {
 
 template <typename T>
-struct is_std_optional : std::false_type {};
-
-template <typename T>
-struct is_std_optional<std::optional<T>> : std::true_type {};
-
-template <typename T>
 struct unwrap_optional {
   using type = T;
 };
@@ -1883,15 +1953,17 @@ struct type_caster<T, std::enable_if_t<anybind::struct_traits<T>::is_specialized
     const char* raw_name = Field::name;
     napi_value js_key = nullptr;
     check(env, napi_create_string_utf8(env, raw_name, NAPI_AUTO_LENGTH, &js_key));
-    bool has_prop = false;
-    check(env, napi_has_property(env, obj, js_key, &has_prop));
+    bool own = false;
+    check(env, napi_has_own_property(env, obj, js_key, &own));
     napi_value js_val = nullptr;
+    check(env, napi_get_property(env, obj, js_key, &js_val));
     napi_valuetype val_type = napi_undefined;
-    if (has_prop) {
-      check(env, napi_get_property(env, obj, js_key, &js_val));
-      check(env, napi_typeof(env, js_val, &val_type));
-    }
-    if (!has_prop || val_type == napi_undefined) {
+    check(env, napi_typeof(env, js_val, &val_type));
+    // Inherited properties count (e.g. getters on a class prototype), except
+    // the built-ins every object inherits, such as `constructor` or `toString`.
+    const bool missing =
+        val_type == napi_undefined || (!own && is_object_prototype_member(env, js_key, js_val));
+    if (missing) {
       if constexpr (traits_t::has_defaults) {
         // Keep the C++ default member initializer from `T out{}`.
         return;
