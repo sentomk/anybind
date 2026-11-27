@@ -5,3 +5,4 @@ node_modules/
 .cache/
 compile_commands.json
 .DS_Store
+examples/md4c/md4c.d.ts

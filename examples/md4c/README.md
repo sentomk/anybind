@@ -18,3 +18,14 @@ Generate TypeScript declarations:
 ```sh
 node bin/anybind-stubgen.mjs examples/md4c/build/md4c.node examples/md4c/md4c.d.ts
 ```
+
+## Benchmark
+
+Build in `Release` mode and compare against pure-JS Markdown parsers (`marked`, `markdown-it`):
+
+```sh
+cmake -S examples/md4c -B examples/md4c/build -DCMAKE_BUILD_TYPE=Release
+cmake --build examples/md4c/build
+npm install --no-save --prefix examples/md4c marked markdown-it
+node examples/md4c/bench.mjs
+```
