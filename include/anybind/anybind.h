@@ -70,6 +70,67 @@ namespace literals {
 inline arg operator""_a(const char* name, std::size_t) { return arg(name); }
 }  // namespace literals
 
+/* === TypeScript type descriptors === */
+
+namespace ts {
+
+struct void_ {};
+struct boolean {};
+struct number {};
+struct bigint {};
+struct string {};
+struct null {};
+struct undefined {};
+struct unknown {};
+struct never {};
+
+/**
+ * Literal type: supports `bool`, integral types, and `const char*` pointing to
+ * a namespace-scope `constexpr char[]` (C++17 NTTP).
+ */
+template <auto V>
+struct literal {
+  static constexpr auto value = V;
+};
+
+template <typename T>
+struct array {};
+
+template <typename... Ts>
+struct tuple {};
+
+template <typename... Ts>
+struct union_ {};
+
+template <typename K, typename V>
+struct record {};
+
+template <const char* Name, typename Type, bool Optional = false>
+struct field {
+  static constexpr const char* name = Name;
+  using type = Type;
+  static constexpr bool optional = Optional;
+};
+
+template <typename... Fields>
+struct object {};
+
+template <typename Sig>
+struct function;
+
+template <typename R, typename... Args>
+struct function<R(Args...)> {};
+
+/** Placeholder for a bound C++ class `T`; resolved via the runtime registry. */
+template <typename T>
+struct bound {};
+
+/** Type whose TypeScript representation differs in parameter vs return position. */
+template <typename In, typename Out>
+struct io {};
+
+}  // namespace ts
+
 class module_;
 
 namespace detail {
@@ -79,6 +140,17 @@ using intrinsic_t = std::remove_cv_t<std::remove_reference_t<T>>;
 
 template <typename... T>
 struct type_list {};
+
+template <typename T>
+struct type_tag {
+  using type = T;
+};
+
+template <typename T>
+inline const void* type_id() noexcept {
+  static const char tag = 0;
+  return &tag;
+}
 
 inline void check(napi_env env, napi_status status) {
   if (status == napi_ok) return;
@@ -99,18 +171,31 @@ inline void expect_type(napi_env env, napi_value value, napi_valuetype expected,
   if (actual != expected) throw type_error("expected " + std::string(ts_name));
 }
 
-/* === Type casters: C++ <-> JS conversion plus TypeScript names for stubs === */
+/* === Type casters: C++ <-> JS conversion plus TypeScript descriptors === */
 
 template <typename T, typename SFINAE = void>
 struct type_caster {
   static_assert(sizeof(T) == 0, "anybind: no type_caster is defined for this type");
 };
 
+template <typename T, typename = void>
+struct ts_of_impl {
+  using type = typename type_caster<intrinsic_t<T>>::ts;
+};
+
+template <typename T>
+struct ts_of_impl<T, std::enable_if_t<std::is_void_v<T>>> {
+  using type = anybind::ts::void_;
+};
+
+template <typename T>
+using ts_of = typename ts_of_impl<T>::type;
+
 template <>
 struct type_caster<bool> {
-  static constexpr std::string_view ts_name = "boolean";
+  using ts = anybind::ts::boolean;
   static bool from_js(napi_env env, napi_value value) {
-    expect_type(env, value, napi_boolean, ts_name);
+    expect_type(env, value, napi_boolean, "boolean");
     bool result;
     check(env, napi_get_value_bool(env, value, &result));
     return result;
@@ -124,9 +209,9 @@ struct type_caster<bool> {
 
 template <typename T>
 struct type_caster<T, std::enable_if_t<std::is_arithmetic_v<T> && !std::is_same_v<T, bool>>> {
-  static constexpr std::string_view ts_name = "number";
+  using ts = anybind::ts::number;
   static T from_js(napi_env env, napi_value value) {
-    expect_type(env, value, napi_number, ts_name);
+    expect_type(env, value, napi_number, "number");
     double d;
     check(env, napi_get_value_double(env, value, &d));
     if constexpr (std::is_integral_v<T>) {
@@ -163,9 +248,9 @@ struct type_caster<T, std::enable_if_t<std::is_arithmetic_v<T> && !std::is_same_
 
 template <>
 struct type_caster<std::string> {
-  static constexpr std::string_view ts_name = "string";
+  using ts = anybind::ts::string;
   static std::string from_js(napi_env env, napi_value value) {
-    expect_type(env, value, napi_string, ts_name);
+    expect_type(env, value, napi_string, "string");
     size_t length = 0;
     check(env, napi_get_value_string_utf8(env, value, nullptr, 0, &length));
     std::string result(length, '\0');
@@ -179,13 +264,270 @@ struct type_caster<std::string> {
   }
 };
 
-template <typename T>
-constexpr std::string_view ts_name_of() {
-  if constexpr (std::is_void_v<T>) {
-    return "void";
-  } else {
-    return type_caster<intrinsic_t<T>>::ts_name;
+/* === TypeScript runtime serializer === */
+
+enum class ts_dir { in, out };
+
+constexpr ts_dir flip_dir(ts_dir d) noexcept { return d == ts_dir::in ? ts_dir::out : ts_dir::in; }
+
+struct ts_context {
+  std::string (*resolve_bound)(void* user_data, const void* id) = nullptr;
+  void* user_data = nullptr;
+};
+
+template <typename Node, ts_dir Dir>
+struct ts_resolve {
+  using type = Node;
+};
+
+template <typename In, typename Out>
+struct ts_resolve<anybind::ts::io<In, Out>, ts_dir::in> : ts_resolve<In, ts_dir::in> {};
+
+template <typename In, typename Out>
+struct ts_resolve<anybind::ts::io<In, Out>, ts_dir::out> : ts_resolve<Out, ts_dir::out> {};
+
+template <typename T, ts_dir Dir>
+struct ts_resolve<anybind::ts::union_<T>, Dir> : ts_resolve<T, Dir> {};
+
+template <typename Node, ts_dir Dir>
+using ts_resolve_t = typename ts_resolve<Node, Dir>::type;
+
+/*
+ * TypeScript type operator precedence (higher binds tighter):
+ *   0: function  `(...) => R`
+ *   1: union     `A | B`
+ *   2: primary   primitives, literals, arrays, tuples, records, objects, bound classes
+ */
+template <typename Node>
+struct ts_prec : std::integral_constant<int, 2> {};
+
+template <typename R, typename... Args>
+struct ts_prec<anybind::ts::function<R(Args...)>> : std::integral_constant<int, 0> {};
+
+template <typename... Ts>
+struct ts_prec<anybind::ts::union_<Ts...>>
+    : std::integral_constant<int, (sizeof...(Ts) > 1 ? 1 : 2)> {};
+
+inline void ts_append_quoted(std::string& out, std::string_view s) {
+  out += '"';
+  for (char c : s) {
+    switch (c) {
+      case '\\':
+        out += "\\\\";
+        break;
+      case '"':
+        out += "\\\"";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      default:
+        out += c;
+        break;
+    }
   }
+  out += '"';
+}
+
+inline bool ts_is_ident(std::string_view s) {
+  if (s.empty()) return false;
+  for (size_t i = 0; i < s.size(); ++i) {
+    const char c = s[i];
+    const bool letter = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '$';
+    const bool digit = c >= '0' && c <= '9';
+    if (i == 0 ? !letter : !(letter || digit)) return false;
+  }
+  return true;
+}
+
+template <typename Node>
+struct ts_serializer {
+  static_assert(sizeof(Node) == 0, "anybind: unsupported TypeScript type descriptor");
+};
+
+template <typename Node, ts_dir Dir, int MinPrec>
+void ts_write_wrapped(std::string& out, const ts_context& ctx) {
+  using resolved = ts_resolve_t<Node, Dir>;
+  constexpr bool parens = ts_prec<resolved>::value < MinPrec;
+  if constexpr (parens) out += '(';
+  ts_serializer<resolved>::template write<Dir>(out, ctx);
+  if constexpr (parens) out += ')';
+}
+
+#define ANYBIND_TS_PRIMITIVE(node_type, text)                \
+  template <>                                                \
+  struct ts_serializer<anybind::ts::node_type> {             \
+    template <ts_dir>                                        \
+    static void write(std::string& out, const ts_context&) { \
+      out += text;                                           \
+    }                                                        \
+  }
+
+ANYBIND_TS_PRIMITIVE(void_, "void");
+ANYBIND_TS_PRIMITIVE(boolean, "boolean");
+ANYBIND_TS_PRIMITIVE(number, "number");
+ANYBIND_TS_PRIMITIVE(bigint, "bigint");
+ANYBIND_TS_PRIMITIVE(string, "string");
+ANYBIND_TS_PRIMITIVE(null, "null");
+ANYBIND_TS_PRIMITIVE(undefined, "undefined");
+ANYBIND_TS_PRIMITIVE(unknown, "unknown");
+ANYBIND_TS_PRIMITIVE(never, "never");
+
+#undef ANYBIND_TS_PRIMITIVE
+
+template <auto V>
+struct ts_serializer<anybind::ts::literal<V>> {
+  template <ts_dir>
+  static void write(std::string& out, const ts_context&) {
+    using T = std::decay_t<decltype(V)>;
+    if constexpr (std::is_same_v<T, bool>) {
+      out += V ? "true" : "false";
+    } else if constexpr (std::is_integral_v<T>) {
+      out += std::to_string(V);
+    } else if constexpr (std::is_same_v<T, const char*>) {
+      // Copy into a local pointer to avoid GCC -Waddress on static arrays.
+      const char* s = V;
+      ts_append_quoted(out, s ? std::string_view(s) : std::string_view{});
+    } else {
+      static_assert(sizeof(T) == 0, "anybind::ts::literal: unsupported literal type");
+    }
+  }
+};
+
+template <typename T>
+struct ts_serializer<anybind::ts::array<T>> {
+  template <ts_dir Dir>
+  static void write(std::string& out, const ts_context& ctx) {
+    ts_write_wrapped<T, Dir, 2>(out, ctx);
+    out += "[]";
+  }
+};
+
+template <typename... Ts>
+struct ts_serializer<anybind::ts::tuple<Ts...>> {
+  template <ts_dir Dir>
+  static void write(std::string& out, [[maybe_unused]] const ts_context& ctx) {
+    out += '[';
+    if constexpr (sizeof...(Ts) > 0) {
+      size_t i = 0;
+      auto append_elem = [&](auto tag) {
+        using Elem = typename decltype(tag)::type;
+        if (i++ > 0) out += ", ";
+        ts_write_wrapped<Elem, Dir, 0>(out, ctx);
+      };
+      (append_elem(type_tag<Ts>{}), ...);
+    }
+    out += ']';
+  }
+};
+
+template <typename... Ts>
+struct ts_serializer<anybind::ts::union_<Ts...>> {
+  template <ts_dir Dir>
+  static void write(std::string& out, [[maybe_unused]] const ts_context& ctx) {
+    if constexpr (sizeof...(Ts) == 0) {
+      out += "never";
+    } else {
+      size_t i = 0;
+      auto append_member = [&](auto tag) {
+        using Member = typename decltype(tag)::type;
+        if (i++ > 0) out += " | ";
+        ts_write_wrapped<Member, Dir, 1>(out, ctx);
+      };
+      (append_member(type_tag<Ts>{}), ...);
+    }
+  }
+};
+
+template <typename K, typename V>
+struct ts_serializer<anybind::ts::record<K, V>> {
+  template <ts_dir Dir>
+  static void write(std::string& out, const ts_context& ctx) {
+    out += "Record<";
+    ts_write_wrapped<K, Dir, 0>(out, ctx);
+    out += ", ";
+    ts_write_wrapped<V, Dir, 0>(out, ctx);
+    out += '>';
+  }
+};
+
+template <typename... Fields>
+struct ts_serializer<anybind::ts::object<Fields...>> {
+  template <ts_dir Dir>
+  static void write(std::string& out, [[maybe_unused]] const ts_context& ctx) {
+    if constexpr (sizeof...(Fields) == 0) {
+      out += "{}";
+    } else {
+      out += "{ ";
+      size_t i = 0;
+      auto append_field = [&](auto tag) {
+        using F = typename decltype(tag)::type;
+        if (i++ > 0) out += "; ";
+        const char* raw_name = F::name;
+        const std::string_view name = raw_name ? std::string_view(raw_name) : std::string_view{};
+        if (ts_is_ident(name)) {
+          out += name;
+        } else {
+          ts_append_quoted(out, name);
+        }
+        out += F::optional ? "?: " : ": ";
+        ts_write_wrapped<typename F::type, Dir, 0>(out, ctx);
+      };
+      (append_field(type_tag<Fields>{}), ...);
+      out += " }";
+    }
+  }
+};
+
+template <typename R, typename... Args>
+struct ts_serializer<anybind::ts::function<R(Args...)>> {
+  template <ts_dir Dir>
+  static void write(std::string& out, const ts_context& ctx) {
+    out += '(';
+    if constexpr (sizeof...(Args) > 0) {
+      size_t i = 0;
+      auto append_arg = [&](auto tag) {
+        using ArgNode = typename decltype(tag)::type;
+        if (i > 0) out += ", ";
+        out += "arg";
+        out += std::to_string(i++);
+        out += ": ";
+        ts_write_wrapped<ArgNode, flip_dir(Dir), 0>(out, ctx);
+      };
+      (append_arg(type_tag<Args>{}), ...);
+    }
+    out += ") => ";
+    ts_write_wrapped<R, Dir, 0>(out, ctx);
+  }
+};
+
+template <typename T>
+struct ts_serializer<anybind::ts::bound<T>> {
+  template <ts_dir>
+  static void write(std::string& out, const ts_context& ctx) {
+    if (ctx.resolve_bound) {
+      out += ctx.resolve_bound(ctx.user_data, type_id<intrinsic_t<T>>());
+    } else {
+      out += "unknown";
+    }
+  }
+};
+
+template <typename Node>
+std::string ts_format(ts_dir dir = ts_dir::out, const ts_context& ctx = {}) {
+  std::string out;
+  if (dir == ts_dir::in) {
+    ts_write_wrapped<Node, ts_dir::in, 0>(out, ctx);
+  } else {
+    ts_write_wrapped<Node, ts_dir::out, 0>(out, ctx);
+  }
+  return out;
 }
 
 /* === Callable introspection === */
@@ -468,35 +810,39 @@ inline std::string ts_param_name(std::string_view name, size_t index) {
 template <typename R, typename... A, typename SlotsTuple, size_t... I>
 std::string ts_signature(const char* name, type_list<A...>,
                          [[maybe_unused]] const SlotsTuple& slots, [[maybe_unused]] size_t min_args,
-                         std::index_sequence<I...>) {
+                         std::index_sequence<I...>, const ts_context& ctx = {}) {
   std::string s = "export function ";
   s += name;
   s += '(';
-  [[maybe_unused]] auto append_param = [&](size_t i, const auto& slot, std::string_view type_name) {
+  [[maybe_unused]] auto append_param = [&](size_t i, const auto& slot, auto tag) {
+    using ParamT = typename decltype(tag)::type;
     if (i > 0) s += ", ";
     s += ts_param_name(slot.name, i);
     if (i >= min_args) {
       // Trailing optional parameter.
       s += "?: ";
-      s += type_name;
+      ts_write_wrapped<ts_of<ParamT>, ts_dir::in, 0>(s, ctx);
     } else if (slot.default_value.has_value()) {
       // Non-trailing default: TS forbids `?` before a required parameter.
       s += ": ";
-      s += type_name;
-      s += " | undefined";
+      ts_write_wrapped<anybind::ts::union_<ts_of<ParamT>, anybind::ts::undefined>, ts_dir::in, 0>(
+          s, ctx);
     } else {
       s += ": ";
-      s += type_name;
+      ts_write_wrapped<ts_of<ParamT>, ts_dir::in, 0>(s, ctx);
     }
   };
-  (append_param(I, std::get<I>(slots), ts_name_of<A>()), ...);
+  (append_param(I, std::get<I>(slots), type_tag<A>{}), ...);
   s += "): ";
-  s += ts_name_of<R>();
+  ts_write_wrapped<ts_of<R>, ts_dir::out, 0>(s, ctx);
   s += ";\n";
   return s;
 }
 
 }  // namespace detail
+
+/** TypeScript type descriptor for C++ type `T`. */
+using detail::ts_of;
 
 /** Handle to the module being initialized inside ANYBIND_MODULE. */
 class module_ {

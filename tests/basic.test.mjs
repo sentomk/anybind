@@ -172,3 +172,22 @@ test("rejects numbers outside the range of float", () => {
   assert.ok(Number.isNaN(m.scale(1, Number.NaN)));
   assert.equal(m.scale(2, 3.4e38), 2 * Math.fround(3.4e38));
 });
+
+test("formats structured TypeScript type descriptors", () => {
+  const tsAddon = require(
+    fileURLToPath(new URL("../build/tests/test_ts.node", import.meta.url)),
+  );
+  assert.equal(tsAddon.failures(), "");
+  assert.match(
+    tsAddon.__anybind_dts__,
+    /export function echoBig\(value: number \| bigint\): bigint;/,
+  );
+  assert.match(
+    tsAddon.__anybind_dts__,
+    /export function echoBigList\(items: \(number \| bigint\)\[\]\): bigint\[\];/,
+  );
+  assert.match(
+    tsAddon.__anybind_dts__,
+    /export function wrapCallback\(cb: \(\(arg0: bigint\) => number \| bigint\) \| undefined, n: number\): \(arg0: number \| bigint\) => bigint;/,
+  );
+});

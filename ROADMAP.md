@@ -36,7 +36,7 @@ with this?_ It ships only once every release criterion below is met.
 ### Scope, in dependency order
 
 1. **Foundations**
-   - [ ] Structured TypeScript type descriptors, replacing the fixed `ts_name` string.
+   - [x] Structured TypeScript type descriptors, replacing the fixed `ts_name` string.
      - Each `type_caster` declares `using ts = ...`: a tree of template types such as
        `ts::string`, `ts::array<ts_of<T>>`, `ts::union_<...>`.
      - First node set, limited to what 0.1 needs: primitives, literals, `array`, `tuple`,
