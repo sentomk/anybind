@@ -1,4 +1,4 @@
-foreach(addon test_basic test_defaults test_bad_default test_ts test_registry test_handles test_stl test_bigint test_struct test_callbacks test_overloads)
+foreach(addon test_basic test_defaults test_bad_default test_ts test_registry test_handles test_stl test_bigint test_struct test_callbacks test_overloads test_stubgen_unsupported)
   anybind_add_module(${addon} ${addon}.cpp)
   # The generator expression keeps multi-config generators (Visual Studio)
   # from appending a per-configuration subdirectory.
@@ -7,6 +7,21 @@ foreach(addon test_basic test_defaults test_bad_default test_ts test_registry te
   target_compile_options(${addon} PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra -Wpedantic -Werror>
     $<$<CXX_COMPILER_ID:MSVC>:/W4 /WX /utf-8>)
+endforeach()
+
+# Build-time .d.ts for every addon whose initialization succeeds; the suite
+# checks they match `__anybind_dts__` at run time.
+foreach(addon test_basic test_defaults test_ts test_registry test_handles test_stl test_bigint test_struct test_callbacks test_overloads)
+  anybind_generate_dts(${addon} OUTPUT "${CMAKE_BINARY_DIR}/tests/${addon}.d.ts")
+  set_target_properties(${addon}_stubgen PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "$<1:${CMAKE_BINARY_DIR}/tests/stubgen>")
+endforeach()
+
+# Stub generators whose run must fail: the suite runs them and checks the error.
+foreach(addon test_bad_default test_stubgen_unsupported)
+  anybind_add_stubgen(${addon})
+  set_target_properties(${addon}_stubgen PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "$<1:${CMAKE_BINARY_DIR}/tests/stubgen>")
 endforeach()
 
 # Code that must be rejected at compile time. Excluded from the default build:

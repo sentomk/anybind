@@ -136,3 +136,83 @@ function(anybind_add_module name)
     target_sources(${name} PRIVATE "${ANYBIND_ROOT}/cmake/win_delay_load_hook.cc")
   endif()
 endfunction()
+
+# anybind_add_stubgen(<target>)
+# Builds <target>_stubgen, a host executable that compiles <target>'s sources with
+# a recording Node-API implementation (no JS engine) and, when run, writes the
+# .d.ts that <target>'s ANYBIND_MODULE builds: `<target>_stubgen [output.d.ts]`.
+# Include directories, definitions, options and linked libraries follow <target>.
+# Sources are read when this is called, so call it after adding all of them.
+function(anybind_add_stubgen target)
+  if(NOT TARGET anybind_stubgen_runtime)
+    set(_dir "${ANYBIND_ROOT}/cmake/stubgen")
+    set(_fallbacks "${CMAKE_BINARY_DIR}/anybind/stubgen_fallbacks.cpp")
+    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/anybind")
+    find_program(ANYBIND_NODE_EXECUTABLE NAMES node REQUIRED)
+    execute_process(
+      COMMAND "${ANYBIND_NODE_EXECUTABLE}" "${_dir}/gen-fallbacks.mjs"
+              "${_dir}/recorder.cpp" "${_fallbacks}" "${ANYBIND_ROOT}"
+      COMMAND_ERROR_IS_FATAL ANY)
+    # Regenerate the fallbacks when the recorder gains or loses functions.
+    set_property(DIRECTORY "${CMAKE_SOURCE_DIR}" APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                 "${_dir}/recorder.cpp" "${_dir}/gen-fallbacks.mjs")
+    add_library(anybind_stubgen_runtime STATIC
+      "${_dir}/recorder.cpp" "${_dir}/main.cpp" "${_fallbacks}")
+    target_link_libraries(anybind_stubgen_runtime PUBLIC anybind::headers)
+    # The Node-API functions are defined in this program, not imported.
+    target_compile_definitions(anybind_stubgen_runtime PUBLIC NAPI_EXTERN=)
+  endif()
+
+  get_target_property(_sources ${target} SOURCES)
+  get_target_property(_source_dir ${target} SOURCE_DIR)
+  set(_stub_sources "")
+  foreach(_src IN LISTS _sources)
+    if(_src MATCHES "win_delay_load_hook\\.cc$" OR _src MATCHES "^\\$<")
+      continue()
+    endif()
+    if(NOT IS_ABSOLUTE "${_src}")
+      set(_src "${_source_dir}/${_src}")
+    endif()
+    list(APPEND _stub_sources "${_src}")
+  endforeach()
+
+  set(_exe ${target}_stubgen)
+  add_executable(${_exe} ${_stub_sources})
+  target_link_libraries(${_exe} PRIVATE
+    anybind_stubgen_runtime
+    "$<FILTER:$<TARGET_PROPERTY:${target},LINK_LIBRARIES>,EXCLUDE,^anybind::anybind$>")
+  target_include_directories(${_exe} PRIVATE "$<TARGET_PROPERTY:${target},INCLUDE_DIRECTORIES>")
+  target_compile_definitions(${_exe} PRIVATE "$<TARGET_PROPERTY:${target},COMPILE_DEFINITIONS>")
+  target_compile_options(${_exe} PRIVATE "$<TARGET_PROPERTY:${target},COMPILE_OPTIONS>")
+  get_target_property(_std ${target} CXX_STANDARD)
+  if(_std)
+    set_target_properties(${_exe} PROPERTIES CXX_STANDARD ${_std})
+  endif()
+endfunction()
+
+# anybind_generate_dts(<target> [OUTPUT <file>])
+# Generates <target>'s TypeScript declarations at build time with
+# anybind_add_stubgen(), without loading the addon. OUTPUT defaults to
+# ${CMAKE_CURRENT_BINARY_DIR}/<target>.d.ts. When cross-compiling, the stub
+# generator runs through CMAKE_CROSSCOMPILING_EMULATOR; without one, nothing is
+# generated, and a build of the same project for the host produces the file.
+function(anybind_generate_dts target)
+  cmake_parse_arguments(PARSE_ARGV 1 ARG "" "OUTPUT" "")
+  if(NOT ARG_OUTPUT)
+    set(ARG_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/${target}.d.ts")
+  endif()
+  if(CMAKE_CROSSCOMPILING AND NOT CMAKE_CROSSCOMPILING_EMULATOR)
+    message(STATUS
+      "anybind: not generating ${target}.d.ts: cross-compiling without "
+      "CMAKE_CROSSCOMPILING_EMULATOR. Build the project for the host to generate it.")
+    return()
+  endif()
+  anybind_add_stubgen(${target})
+  add_custom_command(
+    OUTPUT "${ARG_OUTPUT}"
+    COMMAND ${target}_stubgen "${ARG_OUTPUT}"
+    DEPENDS ${target}_stubgen
+    COMMENT "anybind: generating ${target}.d.ts"
+    VERBATIM)
+  add_custom_target(${target}_dts ALL DEPENDS "${ARG_OUTPUT}")
+endfunction()
