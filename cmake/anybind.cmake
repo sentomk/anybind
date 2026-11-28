@@ -65,12 +65,20 @@ if(NOT EXISTS "${ANYBIND_NODE_API_INCLUDE_DIR}/node_api.h")
 endif()
 
 if(NOT TARGET anybind::anybind)
-  add_library(anybind_headers INTERFACE)
-  add_library(anybind::anybind ALIAS anybind_headers)
-  target_include_directories(anybind_headers INTERFACE
+  # anybind::headers: the include directories and language level only, for code
+  # that provides the Node-API functions itself (the stub generator).
+  add_library(anybind_include INTERFACE)
+  add_library(anybind::headers ALIAS anybind_include)
+  target_include_directories(anybind_include INTERFACE
     "${ANYBIND_ROOT}/include"
     "${ANYBIND_NODE_API_INCLUDE_DIR}")
-  target_compile_features(anybind_headers INTERFACE cxx_std_17)
+  target_compile_features(anybind_include INTERFACE cxx_std_17)
+
+  # anybind::anybind: anybind::headers plus what an addon needs to link against
+  # the Node-API functions of the process that loads it.
+  add_library(anybind_headers INTERFACE)
+  add_library(anybind::anybind ALIAS anybind_headers)
+  target_link_libraries(anybind_headers INTERFACE anybind_include)
 
   if(WIN32)
     if(NOT MSVC)
