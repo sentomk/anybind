@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cmath>
 #include <exception>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -634,6 +635,23 @@ template <typename Node, ts_dir Dir>
 using ts_resolve_t = typename ts_resolve<Node, Dir>::type;
 
 /*
+ * Whether TS type `Node` explicitly includes `undefined` (directly or as a
+ * union member), as `std::optional<T>` does. Such a parameter may be omitted
+ * when it and every parameter after it do. `unknown` (e.g. `anybind::value`)
+ * does not count: declaring the parameter still asks the caller for a value.
+ */
+template <typename Node>
+struct ts_accepts_undefined_impl : std::is_same<Node, anybind::ts::undefined> {};
+
+template <typename... Ts>
+struct ts_accepts_undefined_impl<anybind::ts::union_<Ts...>>
+    : std::disjunction<ts_accepts_undefined_impl<ts_resolve_t<Ts, ts_dir::in>>...> {};
+
+template <typename Node>
+inline constexpr bool ts_accepts_undefined_v =
+    ts_accepts_undefined_impl<ts_resolve_t<Node, ts_dir::in>>::value;
+
+/*
  * TypeScript type operator precedence (higher binds tighter):
  *   0: function  `(...) => R`
  *   1: union     `A | B`
@@ -885,10 +903,23 @@ struct ts_rest_elem<anybind::ts::rest<T>> {
 
 template <typename R, typename... Args>
 struct ts_serializer<anybind::ts::function<R(Args...)>> {
+  /* Index of the first parameter from which every parameter accepts `undefined`. */
+  static constexpr size_t first_omissible() {
+    constexpr bool accepts[] = {ts_accepts_undefined_v<Args>..., false};
+    size_t first = sizeof...(Args);
+    while (first > 0 && accepts[first - 1]) --first;
+    return first;
+  }
+
   template <ts_dir Dir>
   static void write(std::string& out, const ts_context& ctx) {
     out += '(';
     if constexpr (sizeof...(Args) > 0) {
+      // A function handed to JS (`out`) may be called without its trailing
+      // optional parameters. A callback passed in (`in`) is always called by
+      // C++ with every argument, so nothing is optional there.
+      [[maybe_unused]] constexpr size_t omissible =
+          Dir == ts_dir::out ? first_omissible() : sizeof...(Args);
       size_t i = 0;
       auto append_arg = [&](auto tag) {
         using ArgNode = typename decltype(tag)::type;
@@ -900,8 +931,9 @@ struct ts_serializer<anybind::ts::function<R(Args...)>> {
           ++i;
         } else {
           out += "arg";
-          out += std::to_string(i++);
-          out += ": ";
+          out += std::to_string(i);
+          out += i >= omissible ? "?: " : ": ";
+          ++i;
           ts_write_wrapped<ArgNode, flip_dir(Dir), 0>(out, ctx);
         }
       };
@@ -1446,11 +1478,14 @@ struct slots_for_list<type_list<A...>> {
 template <typename SlotsTuple, size_t... I>
 size_t compute_min_args([[maybe_unused]] const SlotsTuple& slots, std::index_sequence<I...>) {
   size_t min_args = 0;
-  // A trailing parameter may be omitted if it has a default or is `std::optional`.
+  // A trailing parameter may be omitted if it has a default or its type accepts
+  // `undefined` (e.g. `std::optional`); a missing argument converts as `undefined`.
   [[maybe_unused]] auto check_one = [&](size_t idx, const auto& slot) {
     using slot_t = intrinsic_t<decltype(slot)>;
     using value_t = typename decltype(slot_t::default_value)::value_type;
-    if (!slot.default_value.has_value() && !is_std_optional<value_t>::value) min_args = idx + 1;
+    if (!slot.default_value.has_value() && !ts_accepts_undefined_v<ts_of<value_t>>) {
+      min_args = idx + 1;
+    }
   };
   (check_one(I, std::get<I>(slots)), ...);
   return min_args;
@@ -1575,6 +1610,23 @@ struct function_record {
 };
 
 /*
+ * Creates a JS function backed by `record`. The function's finalizer owns the
+ * record from then on; if creation fails, the record is freed here.
+ */
+template <typename Record>
+napi_value create_js_function(napi_env env, const char* name, std::unique_ptr<Record> record) {
+  napi_value fn = nullptr;
+  napi_status status =
+      napi_create_function(env, name, NAPI_AUTO_LENGTH, &Record::invoke, record.get(), &fn);
+  if (status == napi_ok) {
+    status = napi_add_finalizer(env, fn, record.get(), &Record::finalize, nullptr, nullptr);
+  }
+  check(env, status);
+  record.release();
+  return fn;
+}
+
+/*
  * Turns a C++-side parameter name into a valid TypeScript parameter name.
  * Only the generated declarations are affected; JS calls are positional.
  */
@@ -1593,13 +1645,6 @@ inline std::string ts_param_name(std::string_view name, size_t index) {
   if (ts_is_reserved_word(out)) out += '_';
   return out;
 }
-
-template <typename Node, typename Target>
-struct ts_contains : std::is_same<Node, Target> {};
-
-template <typename Target, typename... Ts>
-struct ts_contains<anybind::ts::union_<Ts...>, Target>
-    : std::disjunction<ts_contains<Ts, Target>...> {};
 
 template <typename R, typename... A, typename SlotsTuple, size_t... I>
 std::string ts_signature(std::string_view head, type_list<A...>,
@@ -1627,7 +1672,7 @@ std::string ts_signature(std::string_view head, type_list<A...>,
     } else if (slot.default_value.has_value()) {
       // Non-trailing default: TS forbids `?` before a required parameter.
       s += ": ";
-      if constexpr (ts_contains<ts_of<ParamT>, anybind::ts::undefined>::value) {
+      if constexpr (ts_accepts_undefined_v<ts_of<ParamT>>) {
         ts_write_wrapped<ts_of<ParamT>, ts_dir::in, 0>(s, ctx);
       } else {
         ts_write_wrapped<anybind::ts::union_<ts_of<ParamT>, anybind::ts::undefined>, ts_dir::in, 0>(
@@ -2206,6 +2251,77 @@ struct type_caster<anybind::function> {
   }
 };
 
+
+/*
+ * `std::function<R(Args...)>` <-> JS function.
+ *
+ * JS -> C++: the returned `std::function` calls the JS function with converted
+ * arguments and converts its result to `R`. Copies share one persistent
+ * reference, so the callback may be stored and called during later calls into
+ * the addon, but only on the JS thread that owns `env` and while that
+ * environment is alive. A JS exception thrown by the callback propagates
+ * through the C++ caller as `error_already_set`.
+ *
+ * C++ -> JS: a non-empty `std::function` becomes a JS function that converts
+ * and checks its arguments like a bound function.
+ */
+template <typename R, typename... Args>
+struct type_caster<std::function<R(Args...)>> {
+  static_assert(!std::is_reference_v<R>,
+                "anybind: std::function callbacks must return by value, not by reference");
+  ANYBIND_DETAIL_NO_NESTED_VIEW(intrinsic_t<R>);
+
+  using fn_t = std::function<R(Args...)>;
+  using ts = anybind::ts::function<ts_of<R>(ts_of<Args>...)>;
+
+  static fn_t from_js(napi_env env, napi_value value) {
+    expect_type(env, value, napi_function, "function");
+    auto target =
+        std::make_shared<anybind::ref<anybind::function>>(anybind::function(env, value));
+    return [env, target](Args... args) -> R {
+      return call_js(env, *target, std::forward<Args>(args)...);
+    };
+  }
+
+  static napi_value to_js(napi_env env, const fn_t& f) {
+    if (!f) throw std::runtime_error("anybind: cannot convert an empty std::function to JS");
+    using record_t = function_record<fn_t>;
+    typename record_t::slots_t slots{};
+    const size_t min_args = compute_min_args(slots, std::index_sequence_for<Args...>{});
+    return create_js_function(env, "",
+                              std::unique_ptr<record_t>(new record_t{f, std::move(slots), min_args}));
+  }
+
+ private:
+  /* Closes a handle scope even when the callback throws. */
+  struct scope_guard {
+    napi_env env;
+    napi_handle_scope scope;
+    ~scope_guard() { napi_close_handle_scope(env, scope); }
+  };
+
+  template <typename... CallArgs>
+  static R call_js(napi_env env, const anybind::ref<anybind::function>& target,
+                   CallArgs&&... args) {
+    // A fresh scope keeps handles from piling up when C++ calls back in a loop.
+    napi_handle_scope scope = nullptr;
+    check(env, napi_open_handle_scope(env, &scope));
+    scope_guard guard{env, scope};
+    std::optional<anybind::function> fn = target.get();
+    if (!fn) throw std::runtime_error("anybind: callback is no longer available");
+    anybind::value result = fn->call(std::forward<CallArgs>(args)...);
+    if constexpr (std::is_void_v<R>) {
+      (void)result;
+    } else {
+      try {
+        return type_caster<intrinsic_t<R>>::from_js(env, result.raw());
+      } catch (const type_error& e) {
+        throw type_error(std::string("callback return value: ") + e.what());
+      }
+    }
+  }
+};
+
 }  // namespace detail
 
 /** Handle to the module being initialized inside ANYBIND_MODULE. */
@@ -2235,17 +2351,9 @@ class module_ {
           head, typename traits::args{}, slots, min_args, indices{}, ts_ctx);
     });
 
-    auto* record = new record_t{std::forward<Func>(f), std::move(slots), min_args};
-    napi_value fn;
-    napi_status status =
-        napi_create_function(env_, name, NAPI_AUTO_LENGTH, &record_t::invoke, record, &fn);
-    if (status == napi_ok) {
-      status = napi_add_finalizer(env_, fn, record, &record_t::finalize, nullptr, nullptr);
-    }
-    if (status != napi_ok) {
-      delete record;
-      detail::check(env_, status);
-    }
+    napi_value fn = detail::create_js_function(
+        env_, name,
+        std::unique_ptr<record_t>(new record_t{std::forward<Func>(f), std::move(slots), min_args}));
     detail::check(env_, napi_set_named_property(env_, exports_, name, fn));
     dts_ += sig;
     return *this;

@@ -765,6 +765,172 @@ export function registerTests(test) {
     );
   });
 
+  test("calls JS callbacks from C++ through std::function", () => {
+    const cb = require(
+      fileURLToPath(
+        new URL("../build/tests/test_callbacks.node", import.meta.url),
+      ),
+    );
+
+    assert.equal(
+      cb.apply((x) => x * 2, 21),
+      42,
+    );
+    const seen = [];
+    cb.forEachIndexed(["a", "b", "c"], (item, i) => seen.push(`${i}:${item}`));
+    assert.deepEqual(seen, ["0:a", "1:b", "2:c"]);
+    assert.equal(
+      cb.transform("abc", (s) => s.toUpperCase()),
+      "ABC",
+    );
+    // Struct arguments and vector results convert both ways.
+    assert.equal(
+      cb.sumWith((p) => [p.x * 2, p.y * 2]),
+      8,
+    );
+    // Each call gets its own handle scope, so long loops do not pile up handles.
+    assert.equal(
+      cb.callMany((i) => i, 100000),
+      4999950000,
+    );
+
+    // Optional callbacks may be omitted or undefined.
+    assert.equal(cb.maybeApply(), -1);
+    assert.equal(cb.maybeApply(undefined, 3), -1);
+    assert.equal(
+      cb.maybeApply((x) => x + 1, 3),
+      4,
+    );
+
+    // Bad callbacks and bad results are TypeErrors.
+    assert.throws(() => cb.apply(42, 1), {
+      name: "TypeError",
+      message: /argument 1 \(f\): expected function/,
+    });
+    assert.throws(() => cb.apply(() => "nope", 1), {
+      name: "TypeError",
+      message: /callback return value: expected number/,
+    });
+
+    // A JS exception thrown by the callback propagates unchanged.
+    const boom = new Error("boom");
+    assert.throws(
+      () =>
+        cb.apply(() => {
+          throw boom;
+        }, 1),
+      (err) => err === boom,
+    );
+    // C++ sees it as error_already_set; rethrowing keeps the original error.
+    assert.throws(
+      () =>
+        cb.catchInCpp(() => {
+          throw boom;
+        }),
+      (err) => err === boom,
+    );
+    assert.equal(
+      cb.catchInCpp(() => {}),
+      "no error",
+    );
+  });
+
+  test("keeps stored std::function callbacks alive across calls", () => {
+    const cb = require(
+      fileURLToPath(
+        new URL("../build/tests/test_callbacks.node", import.meta.url),
+      ),
+    );
+    let calls = 0;
+    cb.storeCallback((x) => {
+      calls += 1;
+      return x * 10;
+    });
+    globalThis.gc?.();
+    assert.equal(cb.callStored(4), 40);
+    assert.equal(cb.callStored(5), 50);
+    assert.equal(calls, 2);
+    cb.clearStored();
+    assert.throws(() => cb.callStored(1), {
+      name: "Error",
+      message: /no stored callback/,
+    });
+  });
+
+  test("returns C++ callables to JS as functions", () => {
+    const cb = require(
+      fileURLToPath(
+        new URL("../build/tests/test_callbacks.node", import.meta.url),
+      ),
+    );
+
+    const add5 = cb.makeAdder(5);
+    assert.equal(typeof add5, "function");
+    assert.equal(add5(3), 8);
+    assert.equal(add5(3, "extra"), 8);
+    assert.throws(() => add5("x"), {
+      name: "TypeError",
+      message: /argument 1: expected number/,
+    });
+    assert.throws(() => add5(), {
+      name: "TypeError",
+      message: /expected at least 1 argument\(s\), got 0/,
+    });
+
+    // Trailing std::optional parameters of a returned function may be omitted.
+    const hello = cb.makeGreeter("hello");
+    assert.equal(hello("ada"), "hello, ada!");
+    assert.equal(hello("ada", "?"), "hello, ada?");
+
+    // Round trips: C++ callables passed back into C++ and composed.
+    assert.equal(cb.apply(cb.makeAdder(10), 5), 15);
+    const composed = cb.compose(cb.makeAdder(1), (x) => x * 3);
+    assert.equal(composed(4), 15);
+
+    assert.throws(() => cb.makeThrower()(), {
+      name: "Error",
+      message: "from C++",
+    });
+    assert.throws(() => cb.makeEmpty(), {
+      name: "Error",
+      message: /cannot convert an empty std::function/,
+    });
+  });
+
+  test("declares std::function parameters and results as function types", () => {
+    const cb = require(
+      fileURLToPath(
+        new URL("../build/tests/test_callbacks.node", import.meta.url),
+      ),
+    );
+    const dts = cb.__anybind_dts__;
+    assert.match(
+      dts,
+      /export function apply\(f: \(arg0: number\) => number, x: number\): number;/,
+    );
+    assert.match(
+      dts,
+      /export function forEachIndexed\(items: string\[\], cb: \(arg0: string, arg1: number\) => void\): void;/,
+    );
+    assert.match(
+      dts,
+      /export function sumWith\(f: \(arg0: \{ x: number; y: number \}\) => number\[\]\): number;/,
+    );
+    assert.match(
+      dts,
+      /export function maybeApply\(f\?: \(\(arg0: number\) => number\) \| undefined, x\?: number\): number;/,
+    );
+    assert.match(
+      dts,
+      /export function makeAdder\(n: number\): \(arg0: number\) => number;/,
+    );
+    // Optional only where JS calls the function (results), not for callbacks C++ calls.
+    assert.match(
+      dts,
+      /export function makeGreeter\(greeting: string\): \(arg0: string, arg1\?: string \| undefined\) => string;/,
+    );
+  });
+
   test("converts plain 64-bit integers to JS numbers", () => {
     const bi = require(
       fileURLToPath(
