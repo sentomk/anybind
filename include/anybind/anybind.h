@@ -1557,12 +1557,14 @@ struct function_record {
       void* data = nullptr;
       check(env, napi_get_cb_info(env, info, &argc, argv, nullptr, &data));
       auto* record = static_cast<function_record*>(data);
-      if (argc < record->min_args || argc > arity) {
-        std::string expected = record->min_args == arity ? std::to_string(arity)
-                                                         : std::to_string(record->min_args) +
-                                                               " to " + std::to_string(arity);
-        throw type_error("expected " + expected + " argument(s), got " + std::to_string(argc));
+      if (argc < record->min_args) {
+        throw type_error("expected at least " + std::to_string(record->min_args) +
+                         " argument(s), got " + std::to_string(argc));
       }
+      // Extra arguments are ignored, as in JavaScript functions: TypeScript allows
+      // passing this function as a callback that receives more arguments (e.g.
+      // `array.map(fn)` also passes the index and the array).
+      if (argc > arity) argc = arity;
       return call<typename traits::return_type>(env, record->f, argv, argc, record->slots,
                                                 typename traits::args{},
                                                 std::make_index_sequence<arity>{});

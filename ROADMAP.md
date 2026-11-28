@@ -74,7 +74,9 @@ with this?_ It ships only once every release criterion below is met.
          the `.d.ts` is the same on every platform); `anybind::bigint<T>` ↔ `bigint` for full
          precision
    - [ ] Synchronous callbacks: `std::function` ↔ JS functions
-   - [ ] Function overloads, emitted as TypeScript overloads
+   - [ ] Function overloads, emitted as TypeScript overloads. Extra arguments are ignored
+         (as in JS), so dispatch prefers an overload whose arity matches exactly, then
+         the first one, in declaration order, whose parameters match.
 3. **Classes**
    - [ ] `class_<T>`: constructors, methods, properties, static members
    - [ ] Enums and inheritance

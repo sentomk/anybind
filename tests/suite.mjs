@@ -63,7 +63,7 @@ export function registerTests(test) {
     assert.throws(() => m.add(Number.NaN, 0), TypeError);
     assert.throws(() => m.add(1), {
       name: "TypeError",
-      message: /expected 2 argument\(s\), got 1/,
+      message: /expected at least 2 argument\(s\), got 1/,
     });
     assert.throws(() => m.greet(42), {
       name: "TypeError",
@@ -147,14 +147,26 @@ export function registerTests(test) {
     assert.equal(m.formatTag("v", 2, "-beta"), "v2-beta");
   });
 
+  test("ignores extra arguments like a JavaScript function", () => {
+    // Callbacks often receive more arguments than they declare.
+    assert.deepEqual(["a", "b"].map(m.greet), ["hello, a", "hello, b"]);
+    // map passes (value, index, array): index binds to `exp`, the array is dropped.
+    assert.deepEqual([3, 2].map(m.power), [3 ** 0, 2 ** 1]);
+    assert.equal(m.power(2, 3, "ignored"), 8);
+    assert.equal(m.noop(1, 2, 3), undefined);
+    // Extra arguments are not converted, so their getters never run.
+    const untouched = {
+      get value() {
+        throw new Error("extra argument was read");
+      },
+    };
+    assert.equal(m.add(1, 2, untouched), 3);
+  });
+
   test("includes parameter names and arity ranges in TypeError messages", () => {
     assert.throws(() => m.power(), {
       name: "TypeError",
-      message: /expected 1 to 2 argument\(s\), got 0/,
-    });
-    assert.throws(() => m.power(1, 2, 3), {
-      name: "TypeError",
-      message: /expected 1 to 2 argument\(s\), got 3/,
+      message: /expected at least 1 argument\(s\), got 0/,
     });
     assert.throws(() => m.power(2, "bad"), {
       name: "TypeError",
@@ -575,12 +587,12 @@ export function registerTests(test) {
     assert.equal(stl.optLead(undefined, 5), 5);
     assert.throws(() => stl.optTail(), {
       name: "TypeError",
-      message: /expected 1 to 2 argument\(s\), got 0/,
+      message: /expected at least 1 argument\(s\), got 0/,
     });
     // A non-trailing optional stays positional: it accepts undefined but cannot be skipped.
     assert.throws(() => stl.optLead(), {
       name: "TypeError",
-      message: /expected 2 argument\(s\), got 0/,
+      message: /expected at least 2 argument\(s\), got 0/,
     });
     assert.match(
       stl.__anybind_dts__,
