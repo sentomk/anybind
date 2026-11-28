@@ -1475,19 +1475,28 @@ struct slots_for_list<type_list<A...>> {
   using type = std::tuple<arg_slot<storage_t<A>>...>;
 };
 
+/* Whether the parameter type of `Slot` (an `arg_slot<T>`) accepts `undefined`. */
+template <typename Slot>
+struct slot_accepts_undefined
+    : std::bool_constant<
+          ts_accepts_undefined_v<ts_of<typename decltype(Slot::default_value)::value_type>>> {};
+
+/*
+ * A trailing parameter may be omitted if it has a default or its type accepts
+ * `undefined` (e.g. `std::optional`); a missing argument converts as `undefined`.
+ * Written without a generic lambda, which MSVC fails to compile here.
+ */
 template <typename SlotsTuple, size_t... I>
 size_t compute_min_args([[maybe_unused]] const SlotsTuple& slots, std::index_sequence<I...>) {
   size_t min_args = 0;
-  // A trailing parameter may be omitted if it has a default or its type accepts
-  // `undefined` (e.g. `std::optional`); a missing argument converts as `undefined`.
-  [[maybe_unused]] auto check_one = [&](size_t idx, const auto& slot) {
-    using slot_t = intrinsic_t<decltype(slot)>;
-    using value_t = typename decltype(slot_t::default_value)::value_type;
-    if (!slot.default_value.has_value() && !ts_accepts_undefined_v<ts_of<value_t>>) {
-      min_args = idx + 1;
+  if constexpr (sizeof...(I) > 0) {
+    const bool required[] = {
+        (!std::get<I>(slots).default_value.has_value() &&
+         !slot_accepts_undefined<std::tuple_element_t<I, SlotsTuple>>::value)...};
+    for (size_t i = 0; i < sizeof...(I); ++i) {
+      if (required[i]) min_args = i + 1;
     }
-  };
-  (check_one(I, std::get<I>(slots)), ...);
+  }
   return min_args;
 }
 
