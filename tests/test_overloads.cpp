@@ -5,9 +5,13 @@
  */
 #include <anybind/anybind.h>
 
+#include <stdint.h>
+
 #include <functional>
+#include <map>
 #include <optional>
 #include <string>
+#include <variant>
 #include <vector>
 
 namespace {
@@ -20,6 +24,26 @@ struct Size {
 }  // namespace
 
 ANYBIND_STRUCT(Size, w, h);
+
+// The JS value kinds each parameter type accepts, used to order overloads.
+namespace kinds_check {
+namespace k = anybind::detail::js_kind;
+using anybind::detail::caster_kinds;
+static_assert(caster_kinds<bool>::value == k::boolean);
+static_assert(caster_kinds<int>::value == k::number);
+static_assert(caster_kinds<int64_t>::value == (k::number | k::bigint));
+static_assert(caster_kinds<anybind::bigint<int64_t>>::value == (k::number | k::bigint));
+static_assert(caster_kinds<const std::string&>::value == k::string);
+static_assert(caster_kinds<std::optional<int>>::value == (k::number | k::undefined));
+static_assert(caster_kinds<std::vector<int>>::value == k::array);
+static_assert(caster_kinds<Size>::value == (k::object | k::array));
+static_assert(caster_kinds<std::map<std::string, int>>::value == (k::object | k::array));
+static_assert(caster_kinds<std::variant<std::monostate, int, std::string>>::value ==
+              (k::null | k::number | k::string));
+static_assert(caster_kinds<std::function<void()>>::value == k::function);
+static_assert(caster_kinds<anybind::function>::value == k::function);
+static_assert(caster_kinds<anybind::value>::value == k::any);
+}  // namespace kinds_check
 
 ANYBIND_MODULE(test_overloads, m) {
   using namespace anybind::literals;
@@ -52,6 +76,20 @@ ANYBIND_MODULE(test_overloads, m) {
   m.def("strict", [](int) -> std::string { throw anybind::type_error("rejected by body"); },
         "x"_a);
   m.def("strict", [](double) { return std::string("double"); }, "x"_a);
+
+  // The mismatch is on the second argument: kinds rule out the first overload
+  // before the Size argument is converted, so its getters run once.
+  m.def(
+      "place", [](const Size& s, int n) { return "int:" + std::to_string(s.w * n); }, "size"_a,
+      "n"_a);
+  m.def(
+      "place",
+      [](const Size& s, const std::string& label) { return label + ":" + std::to_string(s.h); },
+      "size"_a, "label"_a);
+
+  // Plain 64-bit integers also accept bigint arguments when overloaded.
+  m.def("wide", [](int64_t v) { return "int64:" + std::to_string(v); }, "v"_a);
+  m.def("wide", [](const std::string& s) { return "string:" + s; }, "s"_a);
 
   // Overloads under an export name that needs an alias in the .d.ts.
   m.def("delete", [](int x) { return x; }, "x"_a);

@@ -964,6 +964,37 @@ export function registerTests(test) {
     // Reserved export names keep working with overloads.
     assert.equal(ov.delete(5), 5);
     assert.equal(ov.delete("abc"), 3);
+
+    // An explicit undefined selects a parameter's default.
+    assert.equal(ov.pad("a", undefined), "a/8");
+    // Plain 64-bit integers take bigints too, also when overloaded.
+    assert.equal(ov.wide(5n), "int64:5");
+    assert.equal(ov.wide("x"), "string:x");
+  });
+
+  test("converts an object argument once when another argument rules out an overload", () => {
+    const ov = require(
+      fileURLToPath(
+        new URL("../build/tests/test_overloads.node", import.meta.url),
+      ),
+    );
+    let reads = 0;
+    const size = {
+      get w() {
+        reads += 1;
+        return 2;
+      },
+      get h() {
+        reads += 1;
+        return 3;
+      },
+    };
+    // The int overload is declared first but its second parameter cannot take a string.
+    assert.match(ov.place(size, "label"), /^label:3/);
+    assert.equal(reads, 2);
+    reads = 0;
+    assert.match(ov.place(size, 4), /^int:8/);
+    assert.equal(reads, 2);
   });
 
   test("reports every overload when none matches", () => {

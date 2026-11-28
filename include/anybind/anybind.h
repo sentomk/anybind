@@ -194,6 +194,25 @@ inline const void* type_id() noexcept {
   return &tag;
 }
 
+/*
+ * JS value kinds, as a bit set. Used to skip overloads whose parameters cannot
+ * accept an argument before converting anything (see `overload_set`).
+ */
+namespace js_kind {
+constexpr uint32_t undefined = 1u << 0;
+constexpr uint32_t null = 1u << 1;
+constexpr uint32_t boolean = 1u << 2;
+constexpr uint32_t number = 1u << 3;
+constexpr uint32_t string = 1u << 4;
+constexpr uint32_t bigint = 1u << 5;
+constexpr uint32_t symbol = 1u << 6;
+constexpr uint32_t object = 1u << 7;  // any object that is not an array or a function
+constexpr uint32_t array = 1u << 8;
+constexpr uint32_t function = 1u << 9;
+constexpr uint32_t external = 1u << 10;
+constexpr uint32_t any = ~0u;
+}  // namespace js_kind
+
 inline void check(napi_env env, napi_status status) {
   if (status == napi_ok) return;
   // Must be read before any other Node-API call overwrites it.
@@ -339,6 +358,8 @@ template <typename T>
 struct type_caster<T, std::enable_if_t<std::is_integral_v<T> && !std::is_same_v<T, bool> &&
                                        sizeof(T) == 8>> {
   using ts = anybind::ts::number;
+  // The .d.ts says `number`, but a bigint argument is accepted too.
+  static constexpr uint32_t js_kinds = js_kind::number | js_kind::bigint;
   static T from_js(napi_env env, napi_value value) { return int64_from_js<T>(env, value); }
   static napi_value to_js(napi_env env, T value) {
     constexpr T max_safe = static_cast<T>(9007199254740991LL);
@@ -650,6 +671,61 @@ struct ts_accepts_undefined_impl<anybind::ts::union_<Ts...>>
 template <typename Node>
 inline constexpr bool ts_accepts_undefined_v =
     ts_accepts_undefined_impl<ts_resolve_t<Node, ts_dir::in>>::value;
+
+/*
+ * JS value kinds a parameter of TS type `Node` accepts. Errs on the side of
+ * accepting more: kinds only decide which overloads are tried first.
+ */
+template <typename Node>
+struct ts_kinds : std::integral_constant<uint32_t, js_kind::any> {};
+
+template <typename Node>
+inline constexpr uint32_t ts_kinds_v = ts_kinds<ts_resolve_t<Node, ts_dir::in>>::value;
+
+#define ANYBIND_DETAIL_TS_KINDS(node_type, kinds) \
+  template <>                                     \
+  struct ts_kinds<anybind::ts::node_type> : std::integral_constant<uint32_t, (kinds)> {}
+
+ANYBIND_DETAIL_TS_KINDS(boolean, js_kind::boolean);
+ANYBIND_DETAIL_TS_KINDS(number, js_kind::number);
+ANYBIND_DETAIL_TS_KINDS(bigint, js_kind::bigint);
+ANYBIND_DETAIL_TS_KINDS(string, js_kind::string);
+ANYBIND_DETAIL_TS_KINDS(null, js_kind::null);
+ANYBIND_DETAIL_TS_KINDS(undefined, js_kind::undefined);
+ANYBIND_DETAIL_TS_KINDS(never, 0u);
+
+#undef ANYBIND_DETAIL_TS_KINDS
+
+template <auto V>
+struct ts_kinds<anybind::ts::literal<V>>
+    : std::integral_constant<uint32_t, std::is_same_v<std::decay_t<decltype(V)>, bool>
+                                           ? js_kind::boolean
+                                       : std::is_integral_v<std::decay_t<decltype(V)>>
+                                           ? js_kind::number
+                                           : js_kind::string> {};
+
+template <typename T>
+struct ts_kinds<anybind::ts::array<T>> : std::integral_constant<uint32_t, js_kind::array> {};
+
+template <typename... Ts>
+struct ts_kinds<anybind::ts::tuple<Ts...>> : std::integral_constant<uint32_t, js_kind::array> {};
+
+// Objects and records: arrays are objects too (`anybind::object` accepts them).
+template <typename K, typename V>
+struct ts_kinds<anybind::ts::record<K, V>>
+    : std::integral_constant<uint32_t, js_kind::object | js_kind::array> {};
+
+template <typename... Fields>
+struct ts_kinds<anybind::ts::object<Fields...>>
+    : std::integral_constant<uint32_t, js_kind::object | js_kind::array> {};
+
+template <typename R, typename... Args>
+struct ts_kinds<anybind::ts::function<R(Args...)>>
+    : std::integral_constant<uint32_t, js_kind::function> {};
+
+template <typename... Ts>
+struct ts_kinds<anybind::ts::union_<Ts...>>
+    : std::integral_constant<uint32_t, (0u | ... | ts_kinds_v<Ts>)> {};
 
 /*
  * TypeScript type operator precedence (higher binds tighter):
@@ -1555,6 +1631,49 @@ decltype(auto) forward_arg(S& stored) {
   }
 }
 
+/*
+ * JS value kinds `type_caster<T>` accepts: its `js_kinds` member if it declares
+ * one (when it accepts more than its TS type says), else derived from its `ts`.
+ */
+template <typename T, typename = void>
+struct caster_kinds : std::integral_constant<uint32_t, ts_kinds_v<ts_of<T>>> {};
+
+template <typename T>
+struct caster_kinds<T, std::void_t<decltype(type_caster<intrinsic_t<T>>::js_kinds)>>
+    : std::integral_constant<uint32_t, type_caster<intrinsic_t<T>>::js_kinds> {};
+
+/* The kind of a JS value; never runs user code (no getters, no proxy traps). */
+inline uint32_t js_kind_of(napi_env env, napi_value value) {
+  napi_valuetype type = napi_undefined;
+  check(env, napi_typeof(env, value, &type));
+  switch (type) {
+    case napi_undefined:
+      return js_kind::undefined;
+    case napi_null:
+      return js_kind::null;
+    case napi_boolean:
+      return js_kind::boolean;
+    case napi_number:
+      return js_kind::number;
+    case napi_string:
+      return js_kind::string;
+    case napi_symbol:
+      return js_kind::symbol;
+    case napi_function:
+      return js_kind::function;
+    case napi_external:
+      return js_kind::external;
+    case napi_bigint:
+      return js_kind::bigint;
+    case napi_object: {
+      bool is_array = false;
+      check(env, napi_is_array(env, value, &is_array));
+      return is_array ? js_kind::array : js_kind::object;
+    }
+  }
+  return js_kind::any;
+}
+
 /* Converts the JS arguments into owned storage. Braced initialization keeps it left to right. */
 template <typename... A, typename SlotsTuple, size_t... I>
 std::tuple<storage_t<A>...> load_args([[maybe_unused]] napi_env env, [[maybe_unused]] napi_value* argv,
@@ -1596,6 +1715,17 @@ struct overload_base {
   size_t arity = 0;
   /* TypeScript parameter list and return type, e.g. `(x: number): number`, for error messages. */
   std::string signature;
+  /* JS value kinds each parameter accepts; `undefined` too if it has a default. */
+  std::vector<uint32_t> param_kinds;
+
+  /* Whether every given argument has a kind its parameter accepts. */
+  bool kinds_match(const uint32_t* arg_kinds, size_t argc) const {
+    const size_t n = argc < param_kinds.size() ? argc : param_kinds.size();
+    for (size_t i = 0; i < n; ++i) {
+      if ((param_kinds[i] & arg_kinds[i]) == 0) return false;
+    }
+    return true;
+  }
 
   overload_base() = default;
   overload_base(const overload_base&) = delete;
@@ -1635,6 +1765,13 @@ struct function_record final : overload_base {
                                                             slots(std::move(arg_slots)) {
     min_args = min;
     arity = traits::arity;
+    param_kinds = kinds_of(typename traits::args{}, indices{});
+  }
+
+  template <typename... A, size_t... I>
+  std::vector<uint32_t> kinds_of(type_list<A...>, std::index_sequence<I...>) const {
+    return {(caster_kinds<A>::value |
+             (std::get<I>(slots).default_value.has_value() ? js_kind::undefined : 0u))...};
   }
 
   bool try_call(napi_env env, napi_value* argv, size_t argc, napi_value* result,
@@ -1685,9 +1822,13 @@ struct function_record final : overload_base {
  * Dispatch tries overloads that take every argument first, in declaration
  * order. If none matches, it tries overloads that would ignore extra
  * arguments, the one ignoring the fewest first, then in declaration order.
- * An overload matches when all its arguments convert; conversions run again
- * for each overload tried, so getters on argument objects may run more than
- * once. With a single overload, errors are reported exactly as for it alone.
+ * An overload matches when all its arguments convert. Overloads whose
+ * parameter kinds (number, string, object, ...) fit the arguments are tried
+ * before the others, so conversion, and the getters it may run on argument
+ * objects, normally happens once. Getters can still run more than once when
+ * several overloads take an object at the same position (two struct types, or
+ * a struct and a `std::map`). With a single overload, errors are reported
+ * exactly as for it alone.
  */
 struct overload_set {
   std::string name;
@@ -1741,6 +1882,18 @@ struct overload_set {
     }
     std::stable_sort(order.begin() + static_cast<ptrdiff_t>(taking_all), order.end(),
                      [this](size_t a, size_t b) { return overloads[a]->arity > overloads[b]->arity; });
+
+    // Overloads whose parameter kinds fit the arguments go first. Checking kinds
+    // runs no user code, so a later argument of the wrong kind no longer makes an
+    // object argument convert (and its getters run) once per overload. The rest
+    // are only tried if none of those matches, so kinds never change which
+    // calls succeed.
+    const size_t checked = argc < max_arity ? argc : max_arity;
+    std::vector<uint32_t> arg_kinds(checked);
+    for (size_t i = 0; i < checked; ++i) arg_kinds[i] = js_kind_of(env, argv[i]);
+    std::stable_partition(order.begin(), order.end(), [&](size_t i) {
+      return overloads[i]->kinds_match(arg_kinds.data(), checked);
+    });
 
     std::vector<std::string> mismatches(overloads.size());
     for (size_t i : order) {
