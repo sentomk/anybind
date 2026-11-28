@@ -1555,6 +1555,16 @@ decltype(auto) forward_arg(S& stored) {
   }
 }
 
+/* Converts the JS arguments into owned storage. Braced initialization keeps it left to right. */
+template <typename... A, typename SlotsTuple, size_t... I>
+std::tuple<storage_t<A>...> load_args([[maybe_unused]] napi_env env, [[maybe_unused]] napi_value* argv,
+                                      [[maybe_unused]] size_t argc,
+                                      [[maybe_unused]] const SlotsTuple& slots, type_list<A...>,
+                                      std::index_sequence<I...>) {
+  return std::tuple<storage_t<A>...>{
+      load_arg<intrinsic_t<A>>(env, argv, argc, I, std::get<I>(slots))...};
+}
+
 /*
  * When the bound function always throws and is inlined (Release builds), the
  * code after the call is unreachable. MSVC reports that as C4702, which `/WX`
@@ -1564,13 +1574,9 @@ decltype(auto) forward_arg(S& stored) {
 #pragma warning(push)
 #pragma warning(disable : 4702)
 #endif
-template <typename R, typename F, typename SlotsTuple, typename... A, size_t... I>
-napi_value call(napi_env env, F& f, [[maybe_unused]] napi_value* argv, [[maybe_unused]] size_t argc,
-                [[maybe_unused]] const SlotsTuple& slots, type_list<A...>,
+template <typename R, typename F, typename Values, typename... A, size_t... I>
+napi_value call(napi_env env, F& f, [[maybe_unused]] Values& values, type_list<A...>,
                 std::index_sequence<I...>) {
-  // Braced initialization guarantees left-to-right argument conversion.
-  [[maybe_unused]] std::tuple<storage_t<A>...> values{
-      load_arg<intrinsic_t<A>>(env, argv, argc, I, std::get<I>(slots))...};
   if constexpr (std::is_void_v<R>) {
     f(forward_arg<A>(std::get<I>(values))...);
     napi_value undefined;
@@ -1584,38 +1590,168 @@ napi_value call(napi_env env, F& f, [[maybe_unused]] napi_value* argv, [[maybe_u
 #pragma warning(pop)
 #endif
 
+/* One bound C++ callable, as one overload of a JS function. */
+struct overload_base {
+  size_t min_args = 0;
+  size_t arity = 0;
+  /* TypeScript parameter list and return type, e.g. `(x: number): number`, for error messages. */
+  std::string signature;
+
+  overload_base() = default;
+  overload_base(const overload_base&) = delete;
+  overload_base& operator=(const overload_base&) = delete;
+  virtual ~overload_base() = default;
+
+  /*
+   * Converts the arguments and, if every one converts, calls the function and
+   * stores its JS result. A TypeError while converting means "this overload
+   * does not match": it is reported through `mismatch` instead of thrown.
+   * Errors from the function body itself, including TypeErrors, propagate.
+   */
+  virtual bool try_call(napi_env env, napi_value* argv, size_t argc, napi_value* result,
+                        std::string* mismatch) = 0;
+};
+
+template <typename List>
+struct values_for_list;
+
+template <typename... A>
+struct values_for_list<type_list<A...>> {
+  using type = std::tuple<storage_t<A>...>;
+};
+
 template <typename Func>
-struct function_record {
+struct function_record final : overload_base {
   using traits = function_traits<Func>;
   using slots_t = typename slots_for_list<typename traits::args>::type;
+  using values_t = typename values_for_list<typename traits::args>::type;
+  using indices = std::make_index_sequence<traits::arity>;
 
   Func f;
   slots_t slots;
-  size_t min_args;
 
+  template <typename G>
+  function_record(G&& fn, slots_t arg_slots, size_t min) : f(std::forward<G>(fn)),
+                                                            slots(std::move(arg_slots)) {
+    min_args = min;
+    arity = traits::arity;
+  }
+
+  bool try_call(napi_env env, napi_value* argv, size_t argc, napi_value* result,
+                std::string* mismatch) override {
+    if (argc < min_args) {
+      *mismatch = "expected at least " + std::to_string(min_args) + " argument(s), got " +
+                  std::to_string(argc);
+      return false;
+    }
+    // Extra arguments are ignored, as in JavaScript functions: TypeScript allows
+    // passing this function as a callback that receives more arguments (e.g.
+    // `array.map(fn)` also passes the index and the array).
+    if (argc > arity) argc = arity;
+    std::optional<values_t> values;
+    try {
+      values.emplace(load_args(env, argv, argc, slots, typename traits::args{}, indices{}));
+    } catch (const type_error& e) {
+      *mismatch = e.what();
+      return false;
+    }
+    *result = call<typename traits::return_type>(env, f, *values, typename traits::args{},
+                                                 indices{});
+    return true;
+  }
+
+  /* JS entry point when this callable is the only one behind a JS function. */
   static napi_value invoke(napi_env env, napi_callback_info info) {
     return guard(env, [&]() -> napi_value {
-      constexpr size_t arity = traits::arity;
-      size_t argc = arity;
-      napi_value argv[arity > 0 ? arity : 1];
+      constexpr size_t n = traits::arity;
+      size_t argc = n;
+      napi_value argv[n > 0 ? n : 1];
       void* data = nullptr;
       check(env, napi_get_cb_info(env, info, &argc, argv, nullptr, &data));
       auto* record = static_cast<function_record*>(data);
-      if (argc < record->min_args) {
-        throw type_error("expected at least " + std::to_string(record->min_args) +
-                         " argument(s), got " + std::to_string(argc));
-      }
-      // Extra arguments are ignored, as in JavaScript functions: TypeScript allows
-      // passing this function as a callback that receives more arguments (e.g.
-      // `array.map(fn)` also passes the index and the array).
-      if (argc > arity) argc = arity;
-      return call<typename traits::return_type>(env, record->f, argv, argc, record->slots,
-                                                typename traits::args{},
-                                                std::make_index_sequence<arity>{});
+      napi_value result = nullptr;
+      std::string mismatch;
+      if (!record->try_call(env, argv, argc, &result, &mismatch)) throw type_error(mismatch);
+      return result;
     });
   }
 
   static void finalize(napi_env, void* data, void*) { delete static_cast<function_record*>(data); }
+};
+
+/*
+ * Every callable bound under one export name, behind a single JS function.
+ *
+ * Dispatch tries overloads that take every argument first, in declaration
+ * order. If none matches, it tries overloads that would ignore extra
+ * arguments, the one ignoring the fewest first, then in declaration order.
+ * An overload matches when all its arguments convert; conversions run again
+ * for each overload tried, so getters on argument objects may run more than
+ * once. With a single overload, errors are reported exactly as for it alone.
+ */
+struct overload_set {
+  std::string name;
+  std::vector<std::unique_ptr<overload_base>> overloads;
+  size_t max_arity = 0;
+
+  void add(std::unique_ptr<overload_base> overload) {
+    max_arity = std::max(max_arity, overload->arity);
+    overloads.push_back(std::move(overload));
+  }
+
+  static napi_value invoke(napi_env env, napi_callback_info info) {
+    return guard(env, [&]() -> napi_value {
+      constexpr size_t inline_capacity = 8;
+      napi_value inline_argv[inline_capacity];
+      size_t argc = inline_capacity;
+      void* data = nullptr;
+      check(env, napi_get_cb_info(env, info, &argc, inline_argv, nullptr, &data));
+      auto* set = static_cast<overload_set*>(data);
+      napi_value* argv = inline_argv;
+      std::vector<napi_value> heap_argv;
+      if (set->max_arity > inline_capacity) {
+        heap_argv.resize(set->max_arity);
+        size_t capacity = set->max_arity;
+        check(env, napi_get_cb_info(env, info, &capacity, heap_argv.data(), nullptr, nullptr));
+        argv = heap_argv.data();
+      }
+      return set->dispatch(env, argv, argc);
+    });
+  }
+
+  static void finalize(napi_env, void* data, void*) { delete static_cast<overload_set*>(data); }
+
+ private:
+  napi_value dispatch(napi_env env, napi_value* argv, size_t argc) {
+    napi_value result = nullptr;
+    if (overloads.size() == 1) {
+      std::string mismatch;
+      if (overloads[0]->try_call(env, argv, argc, &result, &mismatch)) return result;
+      throw type_error(mismatch);
+    }
+
+    std::vector<size_t> order;
+    order.reserve(overloads.size());
+    for (size_t i = 0; i < overloads.size(); ++i) {
+      if (argc <= overloads[i]->arity) order.push_back(i);
+    }
+    const size_t taking_all = order.size();
+    for (size_t i = 0; i < overloads.size(); ++i) {
+      if (argc > overloads[i]->arity) order.push_back(i);
+    }
+    std::stable_sort(order.begin() + static_cast<ptrdiff_t>(taking_all), order.end(),
+                     [this](size_t a, size_t b) { return overloads[a]->arity > overloads[b]->arity; });
+
+    std::vector<std::string> mismatches(overloads.size());
+    for (size_t i : order) {
+      if (overloads[i]->try_call(env, argv, argc, &result, &mismatches[i])) return result;
+    }
+    std::string message = "no overload of " + name + "() matches the arguments:";
+    for (size_t i = 0; i < overloads.size(); ++i) {
+      message += "\n  " + name + overloads[i]->signature + "\n    " + mismatches[i];
+    }
+    throw type_error(message);
+  }
 };
 
 /*
@@ -2298,7 +2434,7 @@ struct type_caster<std::function<R(Args...)>> {
     typename record_t::slots_t slots{};
     const size_t min_args = compute_min_args(slots, std::index_sequence_for<Args...>{});
     return create_js_function(env, "",
-                              std::unique_ptr<record_t>(new record_t{f, std::move(slots), min_args}));
+                              std::unique_ptr<record_t>(new record_t(f, std::move(slots), min_args)));
   }
 
  private:
@@ -2339,7 +2475,12 @@ class module_ {
   module_(napi_env env, napi_value exports)
       : env_(env), exports_(exports), registry_(&detail::type_registry::get(env)) {}
 
-  /** Binds a free function, function pointer or (capturing) lambda. */
+  /**
+   * Binds a free function, function pointer or (capturing) lambda. Binding
+   * several callables under the same name creates overloads: a call runs the
+   * first one, by the rules of `detail::overload_set`, whose parameters match
+   * the arguments, and the `.d.ts` lists one signature per overload.
+   */
   template <typename Func, typename... Extra>
   module_& def(const char* name, Func&& f, Extra&&... extra) {
     using F = std::decay_t<Func>;
@@ -2355,16 +2496,30 @@ class module_ {
     auto slots = detail::make_arg_slots(typename traits::args{}, std::forward<Extra>(extra)...);
     size_t min_args = detail::compute_min_args(slots, indices{});
     detail::ts_context ts_ctx{&detail::resolve_bound_type, registry_};
-    std::string sig = declare_function(name, [&](std::string_view head) {
-      return detail::ts_signature<typename traits::return_type>(
-          head, typename traits::args{}, slots, min_args, indices{}, ts_ctx);
-    });
+    // `(params): R;\n`, prefixed with the declaration head when the .d.ts is assembled.
+    std::string sig = detail::ts_signature<typename traits::return_type>(
+        "", typename traits::args{}, slots, min_args, indices{}, ts_ctx);
 
-    napi_value fn = detail::create_js_function(
-        env_, name,
-        std::unique_ptr<record_t>(new record_t{std::forward<Func>(f), std::move(slots), min_args}));
-    detail::check(env_, napi_set_named_property(env_, exports_, name, fn));
-    dts_ += sig;
+    auto record = std::unique_ptr<record_t>(
+        new record_t(std::forward<Func>(f), std::move(slots), min_args));
+    record->signature = sig.substr(0, sig.size() - 2);
+
+    const std::string export_name = name ? name : "";
+    auto it = std::find_if(entries_.begin(), entries_.end(),
+                           [&](const export_entry& e) { return e.name == export_name; });
+    if (it == entries_.end()) {
+      auto set = std::make_unique<detail::overload_set>();
+      set->name = export_name;
+      set->add(std::move(record));
+      detail::overload_set* raw_set = set.get();
+      napi_value fn = detail::create_js_function(env_, export_name.c_str(), std::move(set));
+      detail::check(env_, napi_set_named_property(env_, exports_, export_name.c_str(), fn));
+      entries_.push_back(export_entry{export_name, local_name_for(export_name), {sig}, raw_set});
+    } else {
+      it->set->add(std::move(record));
+      it->signatures.push_back(std::move(sig));
+    }
+    rebuild_dts();
     return *this;
   }
 
@@ -2375,51 +2530,71 @@ class module_ {
   const std::string& dts() const { return dts_; }
 
  private:
+  /* One export name, with the TS signatures of its overloads in declaration order. */
+  struct export_entry {
+    std::string name;
+    /* Private declaration name, or empty if `name` can be declared directly. */
+    std::string local;
+    std::vector<std::string> signatures;
+    detail::overload_set* set;
+  };
+
   /*
-   * Emits the declaration for export `name`. A valid identifier becomes
-   * `export function name(...)`. A reserved word (`delete`, `default`) or a
-   * name that is not an identifier (`my-fn`) is declared under a private local
-   * name and re-exported with `export { local as name }`; the string form
-   * `export { local as "my-fn" }` needs TypeScript 5.6 or later.
+   * A valid identifier is declared as `export function name(...)`. A reserved
+   * word (`delete`, `default`) or a name that is not an identifier (`my-fn`) is
+   * declared under a private local name and re-exported with
+   * `export { local as name }`; the string form `export { local as "my-fn" }`
+   * needs TypeScript 5.6 or later.
    */
-  template <typename Sig>
-  std::string declare_function(const char* name, Sig&& signature) {
-    const std::string_view export_name = name ? std::string_view(name) : std::string_view{};
-    const bool ident = detail::ts_is_ident(export_name);
-    if (ident && !detail::ts_is_reserved_word(export_name)) {
-      return signature("export function " + std::string(export_name));
-    }
+  std::string local_name_for(std::string_view export_name) {
+    if (detail::ts_is_ident(export_name) && !detail::ts_is_reserved_word(export_name)) return {};
     std::string base = "__anybind_";
     for (char c : export_name) {
       const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
                       c == '_' || c == '$';
       base += ok ? c : '_';
     }
+    auto taken = [&](const std::string& candidate) {
+      return std::any_of(entries_.begin(), entries_.end(),
+                         [&](const export_entry& e) { return e.local == candidate; });
+    };
     std::string local = base;
-    for (size_t n = 2; std::find(local_names_.begin(), local_names_.end(), local) !=
-                       local_names_.end();
-         ++n) {
-      local = base + "_" + std::to_string(n);
+    for (size_t n = 2; taken(local); ++n) local = base + "_" + std::to_string(n);
+    return local;
+  }
+
+  void rebuild_dts() {
+    dts_.clear();
+    for (const auto& e : entries_) {
+      for (size_t i = 0; i < e.signatures.size(); ++i) {
+        const std::string& sig = e.signatures[i];
+        // C++ overloads can map to the same TS signature (`int` and `double` are
+        // both `number`); one declaration is enough.
+        if (std::find(e.signatures.begin(), e.signatures.begin() + static_cast<ptrdiff_t>(i),
+                      sig) != e.signatures.begin() + static_cast<ptrdiff_t>(i)) {
+          continue;
+        }
+        dts_ += e.local.empty() ? "export function " + e.name : "declare function " + e.local;
+        dts_ += sig;
+      }
+      if (e.local.empty()) continue;
+      dts_ += "export { ";
+      dts_ += e.local;
+      dts_ += " as ";
+      if (detail::ts_is_ident(e.name)) {
+        dts_ += e.name;
+      } else {
+        detail::ts_append_quoted(dts_, e.name);
+      }
+      dts_ += " };\n";
     }
-    local_names_.push_back(local);
-    std::string out = signature("declare function " + local);
-    out += "export { ";
-    out += local;
-    out += " as ";
-    if (ident) {
-      out += export_name;
-    } else {
-      detail::ts_append_quoted(out, export_name);
-    }
-    out += " };\n";
-    return out;
   }
 
   napi_env env_;
   napi_value exports_;
   detail::type_registry* registry_;
   std::string dts_;
-  std::vector<std::string> local_names_;
+  std::vector<export_entry> entries_;
 };
 
 namespace detail {

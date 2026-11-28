@@ -75,9 +75,10 @@ with this?_ It ships only once every release criterion below is met.
          precision
    - [x] Synchronous callbacks: `std::function` ↔ JS functions (callbacks may be stored and
          called later, but only on the JS thread; cross-thread calls are step 4)
-   - [ ] Function overloads, emitted as TypeScript overloads. Extra arguments are ignored
-         (as in JS), so dispatch prefers an overload whose arity matches exactly, then
-         the first one, in declaration order, whose parameters match.
+   - [x] Function overloads, emitted as TypeScript overloads. Extra arguments are ignored
+         (as in JS), so dispatch tries overloads that take every argument first, in
+         declaration order, then those that would ignore extra arguments, fewest ignored
+         first.
 3. **Classes**
    - [ ] `class_<T>`: constructors, methods, properties, static members
    - [ ] Enums and inheritance

@@ -931,6 +931,109 @@ export function registerTests(test) {
     );
   });
 
+  test("dispatches overloads by argument type and count", () => {
+    const ov = require(
+      fileURLToPath(
+        new URL("../build/tests/test_overloads.node", import.meta.url),
+      ),
+    );
+
+    // Declaration order decides between overlapping types: int before double.
+    assert.equal(ov.describe(1), "int");
+    assert.equal(ov.describe(1.5), "double");
+    assert.equal(ov.describe("x"), "string");
+    assert.equal(ov.describe([1, 2, 3]), "list of 3");
+    assert.equal(ov.describe({ w: 1, h: 2 }), "size");
+    assert.equal(
+      ov.describe((x) => x + 41),
+      "fn:42",
+    );
+
+    // Argument count.
+    assert.equal(ov.area(3), 9);
+    assert.equal(ov.area(2, 3), 6);
+    // Extra arguments: the overload ignoring the fewest wins, not the first declared.
+    assert.equal(ov.area(2, 3, "extra"), 6);
+
+    // Defaults and optional parameters count toward the arity that matches.
+    assert.equal(ov.pad("a"), "a/8");
+    assert.equal(ov.pad("a", 2), "a/2");
+    assert.equal(ov.pad(7), "7#4");
+    assert.equal(ov.pad(7, 1), "7#1");
+
+    // Reserved export names keep working with overloads.
+    assert.equal(ov.delete(5), 5);
+    assert.equal(ov.delete("abc"), 3);
+  });
+
+  test("reports every overload when none matches", () => {
+    const ov = require(
+      fileURLToPath(
+        new URL("../build/tests/test_overloads.node", import.meta.url),
+      ),
+    );
+    assert.throws(
+      () => ov.describe(true),
+      (err) => {
+        assert.equal(err.name, "TypeError");
+        assert.match(
+          err.message,
+          /^no overload of describe\(\) matches the arguments:/,
+        );
+        assert.match(
+          err.message,
+          /\n {2}describe\(value: string\): string\n {4}argument 1 \(value\): expected string/,
+        );
+        assert.match(
+          err.message,
+          /\n {2}describe\(fn: \(arg0: number\) => number\): string\n {4}argument 1 \(fn\): expected function/,
+        );
+        return true;
+      },
+    );
+    assert.throws(() => ov.area(), {
+      name: "TypeError",
+      message:
+        /area\(side: number\): number\n {4}expected at least 1 argument\(s\), got 0/,
+    });
+
+    // A TypeError from the function body propagates instead of trying the next overload.
+    assert.throws(() => ov.strict(1), {
+      name: "TypeError",
+      message: "rejected by body",
+    });
+    assert.equal(ov.strict(1.5), "double");
+  });
+
+  test("declares one TypeScript signature per distinct overload", () => {
+    const ov = require(
+      fileURLToPath(
+        new URL("../build/tests/test_overloads.node", import.meta.url),
+      ),
+    );
+    const dts = ov.__anybind_dts__;
+    // int and double are both `number`: the duplicate signature is emitted once.
+    assert.equal(
+      dts.match(/export function describe\(value: number\): string;/g).length,
+      1,
+    );
+    assert.match(
+      dts,
+      /export function area\(side: number\): number;\nexport function area\(w: number, h: number\): number;\n/,
+    );
+    assert.match(
+      dts,
+      /export function pad\(s: string, width\?: number\): string;\nexport function pad\(n: number, width\?: number \| undefined\): string;\n/,
+    );
+    assert.ok(
+      dts.includes(
+        "declare function __anybind_delete(x: number): number;\n" +
+          "declare function __anybind_delete(s: string): number;\n" +
+          "export { __anybind_delete as delete };\n",
+      ),
+    );
+  });
+
   test("converts plain 64-bit integers to JS numbers", () => {
     const bi = require(
       fileURLToPath(
