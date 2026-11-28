@@ -46,15 +46,10 @@ with this?_ It ships only once every release criterion below is met.
        value).
      - Optional parameters stay a function-signature concern; the existing `arg` default
        value logic is kept.
-     - Serializers are separate from the tree: a compile-time encoder writes constant bytes
-       into a dedicated binary section (for build-time `.d.ts` extraction, using internal
-       fixed-length char array concatenation); a runtime serializer produces the TS text
-       for `__anybind_dts__`. Other outputs (ArkTS, JSON Schema) can be added later.
-     - To decide before implementing: how class names are known at build time, since
-       `class_<T>("Foo")` passes the name at run time. Either class registration also
-       writes a compile-time "type ID → class name" entry into the section (requires an
-       API change), or build-time extraction does not cover signatures involving classes
-       for now.
+     - The runtime serializer produces the TS text for `__anybind_dts__`; other outputs
+       (ArkTS, JSON Schema) can be added later. Build-time extraction does not use a
+       compile-time encoder (see the build-time `.d.ts` item below), which also settles
+       how class names are known at build time.
      - Risks: deeply nested types may slow compilation or hit template depth limits, so
        prototype and measure first. The `ts::` nodes become public API (users need them
        for custom casters in 0.3), so they are part of the 0.1 API review.
@@ -67,6 +62,25 @@ with this?_ It ships only once every release criterion below is met.
          references.
    - [ ] `.d.ts` generation at build time, without loading the `.node` (needed for
          cross-compilation, e.g. HarmonyOS or Android arm64 built on an x86 host).
+     - Encoding signatures into a binary section at compile time does not work with the
+       current API: export names (`m.def("add", ...)`), `arg` names and whether a
+       parameter has a default are run-time values, which C++17 cannot turn into
+       constants without a macro-based API.
+     - Instead, the binding sources are also compiled for the host into a small
+       executable, linked with a recording Node-API implementation that needs no JS
+       engine. It runs the module's initialization and writes the `.d.ts` the module
+       builds, so the output is the same text as `__anybind_dts__`.
+     - Node-API functions the recorder does not implement are generated from the
+       `node-api-headers` symbol list as stubs that report "not supported during stub
+       generation", so bindings that use them elsewhere still link.
+     - CMake: `anybind_generate_dts(<target>)` builds the executable and generates the
+       `.d.ts` as part of the build. When cross-compiling, it runs through
+       `CMAKE_CROSSCOMPILING_EMULATOR` if set; otherwise the `.d.ts` comes from a host
+       build of the same project.
+     - Class names need no compile-time mechanism: `class_<T>("Foo")` runs during
+       initialization like any other registration.
+     - Limits: the binding code must compile for the host, and initialization code that
+       calls unsupported Node-API functions fails stub generation with a clear error.
 2. **Type system**
    - [x] `std::vector` / `std::array` ↔ `Array`, `std::optional` ↔ `T | undefined`,
          `std::variant` ↔ union, `std::map` / plain structs ↔ objects, `std::string_view`
